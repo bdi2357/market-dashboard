@@ -20,7 +20,10 @@ start_date = end_date - timedelta(days=period_options[period_label])
 
 @st.cache_data(ttl=300)
 def load_data(symbol, start, end):
-    return yf.download(symbol, start=start, end=end, progress=False)
+    df = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=True)
+    if not df.empty:
+        df.index = df.index.tz_localize(None)
+    return df
 
 with st.spinner(f"Loading {ticker}..."):
     df = load_data(ticker, start_date, end_date)
@@ -30,7 +33,6 @@ if df.empty:
     st.stop()
 
 # Summary metrics
-info = yf.Ticker(ticker).fast_info
 last_price = df["Close"].iloc[-1].item()
 prev_price = df["Close"].iloc[-2].item() if len(df) > 1 else last_price
 change = last_price - prev_price
