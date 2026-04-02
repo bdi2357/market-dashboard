@@ -14,11 +14,34 @@ Sections:
 """
 
 import re
+import hashlib
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from pathlib import Path
 from typing import Optional
+
+# Cache peer info in data/cache/ with a 24h TTL (same dir as fetcher.py uses)
+_PEER_CACHE_DIR = Path(__file__).parent.parent / "data" / "cache"
+_PEER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _peer_cache_path(ticker: str) -> Path:
+    h = hashlib.md5(f"peers_{ticker}".encode()).hexdigest()[:12]
+    return _PEER_CACHE_DIR / f"{h}.parquet"
+
+
+def _load_peer_cache(ticker: str) -> Optional[pd.DataFrame]:
+    path = _peer_cache_path(ticker)
+    if not path.exists():
+        return None
+    age_h = (pd.Timestamp.now() - pd.Timestamp(path.stat().st_mtime, unit="s")).total_seconds() / 3600
+    if age_h > 24:
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return None
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -40,9 +63,13 @@ def _pct_rank(value: float, peer_values: list) -> float:
 def fetch_peer_info(ticker: str, max_peers: int = 20) -> pd.DataFrame:
     """
     Build sector peer group using S&P 500 constituents from Wikipedia.
-    Returns DataFrame of peer info dicts (one row per peer).
+    Results are parquet-cached for 24h to avoid repeated API calls.
     Falls back to a hardcoded list if Wikipedia is unavailable.
     """
+    cached = _load_peer_cache(ticker)
+    if cached is not None:
+        return cached
+
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         sp500 = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
@@ -52,7 +79,6 @@ def fetch_peer_info(ticker: str, max_peers: int = 20) -> pd.DataFrame:
     t0 = yf.Ticker(ticker)
     info0 = t0.info or {}
     sector = info0.get("sector", "")
-    industry = info0.get("industry", "")
 
     rows = []
     candidates = [s for s in sp500 if s != ticker] if sp500 else [
@@ -87,7 +113,13 @@ def fetch_peer_info(ticker: str, max_peers: int = 20) -> pd.DataFrame:
         except Exception:
             continue
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        try:
+            df.to_parquet(_peer_cache_path(ticker))
+        except Exception:
+            pass
+    return df
 
 
 # ── VALUATION RISK ────────────────────────────────────────────────────────────

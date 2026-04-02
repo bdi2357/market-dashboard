@@ -493,14 +493,24 @@ with tab5:
                     row=row, col=1,
                 )
 
-        # Add regime background bands
-        for i in range(len(macro_regimes) - 1):
-            t0 = macro_regimes.index[i]
-            t1 = macro_regimes.index[i + 1]
-            r = macro_regimes.iloc[i]
+        # Compress daily regime series into contiguous blocks before adding
+        # vrects — avoids creating 700+ shapes (one per day) which freezes the chart.
+        if len(macro_regimes) > 0:
+            prev_r = str(macro_regimes.iloc[0])
+            block_start = macro_regimes.index[0]
+            for t, r in macro_regimes.items():
+                r = str(r)
+                if r != prev_r:
+                    fig_macro.add_vrect(
+                        x0=block_start, x1=t,
+                        fillcolor=REGIME_COLORS.get(prev_r, "gray"),
+                        opacity=0.08, line_width=0,
+                    )
+                    block_start = t
+                    prev_r = r
             fig_macro.add_vrect(
-                x0=t0, x1=t1,
-                fillcolor=REGIME_COLORS.get(r, "gray"),
+                x0=block_start, x1=macro_regimes.index[-1],
+                fillcolor=REGIME_COLORS.get(prev_r, "gray"),
                 opacity=0.08, line_width=0,
             )
 
@@ -563,10 +573,14 @@ with tab6:
     st.subheader(f"MA Crossover Backtest — {_ticker}")
     st.caption(f"Strategy: Long when {fast_ma}d MA > {slow_ma}d MA | Sizing: {sizing_method}")
 
-    with st.spinner("Running backtest..."):
-        bt = run_backtest(prices, fast_ma=int(fast_ma), slow_ma=int(slow_ma), sizing=sizing_method)
-        ci = bootstrap_sharpe_ci(bt["returns"], n_boot=1000)
-        stress = stress_test(prices, fast_ma=int(fast_ma), slow_ma=int(slow_ma))
+    _bt_key = f"bt_{_ticker}_{fast_ma}_{slow_ma}_{sizing_method}"
+    if _bt_key not in st.session_state:
+        with st.spinner("Running backtest..."):
+            _bt = run_backtest(prices, fast_ma=int(fast_ma), slow_ma=int(slow_ma), sizing=sizing_method)
+            _ci = bootstrap_sharpe_ci(_bt["returns"], n_boot=500)
+            _stress = stress_test(prices, fast_ma=int(fast_ma), slow_ma=int(slow_ma))
+            st.session_state[_bt_key] = (_bt, _ci, _stress)
+    bt, ci, stress = st.session_state[_bt_key]
 
     s = bt["summary"]
     bm1, bm2, bm3, bm4, bm5 = st.columns(5)
@@ -632,27 +646,29 @@ with tab6:
 with tab7:
     st.subheader(f"Fundamental Risk Analysis — {_ticker}")
 
-    with st.spinner("Loading fundamental data (this may take ~15s on first run)..."):
-        # Get latest FRED rate for ERP calculation
-        fred_rate = None
-        if not macro_df.empty and "DGS10" in macro_df.columns:
-            fred_rate = float(macro_df["DGS10"].dropna().iloc[-1])
+    _fund_key = f"fund_{_ticker}"
+    if _fund_key not in st.session_state:
+        with st.spinner("Loading fundamental data (first run ~20s, cached after)..."):
+            fred_rate = None
+            if not macro_df.empty and "DGS10" in macro_df.columns:
+                fred_rate = float(macro_df["DGS10"].dropna().iloc[-1])
 
-        # Get current macro regime for regime mismatch check
-        from risk.metrics import classify_macro_regime
-        macro_regimes = classify_macro_regime(macro_df) if not macro_df.empty else pd.Series(dtype=str)
-        current_regime = str(macro_regimes.iloc[-1]) if len(macro_regimes) > 0 else "MIXED"
+            from risk.metrics import classify_macro_regime as _cmr
+            _mr = _cmr(macro_df) if not macro_df.empty else pd.Series(dtype=str)
+            current_regime = str(_mr.iloc[-1]) if len(_mr) > 0 else "MIXED"
 
-        val_r   = valuation_risk(_ticker, fred_dgs10=fred_rate)
-        bs_r    = balance_sheet_risk(_ticker)
-        eq_r    = earnings_quality(_ticker)
-        cf_r    = cashflow_risk(_ticker)
-        gv_r    = growth_value_classification(_ticker, macro_regime=current_regime)
-        fund_scores = composite_fundamental_score(val_r, bs_r, eq_r, cf_r, gv_r)
-        st.session_state.fund_scores = fund_scores
+            val_r   = valuation_risk(_ticker, fred_dgs10=fred_rate)
+            bs_r    = balance_sheet_risk(_ticker)
+            eq_r    = earnings_quality(_ticker)
+            cf_r    = cashflow_risk(_ticker)
+            gv_r    = growth_value_classification(_ticker, macro_regime=current_regime)
+            fund_scores = composite_fundamental_score(val_r, bs_r, eq_r, cf_r, gv_r)
+            ticker_name = info.get("name", _ticker)
+            news_items  = fetch_material_news(_ticker, ticker_name=ticker_name)
+            st.session_state[_fund_key] = (val_r, bs_r, eq_r, cf_r, gv_r, fund_scores, news_items)
 
-        ticker_name = info.get("name", _ticker)
-        news_items  = fetch_material_news(_ticker, ticker_name=ticker_name)
+    val_r, bs_r, eq_r, cf_r, gv_r, fund_scores, news_items = st.session_state[_fund_key]
+    st.session_state.fund_scores = fund_scores
 
     # ── DIVERGENCE ALERT BANNER ───────────────────────────────────────────────
     mkt_score  = composite_risk_score(prices, volume, bench_prices)["total"]
