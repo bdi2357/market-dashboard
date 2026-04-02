@@ -40,6 +40,11 @@ from risk.metrics import (
     composite_risk_score,
 )
 from backtest.engine import run_backtest, stress_test, bootstrap_sharpe_ci
+from risk.fundamental import (
+    valuation_risk, balance_sheet_risk, earnings_quality,
+    cashflow_risk, growth_value_classification,
+    fetch_material_news, composite_fundamental_score,
+)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Risk Dashboard", layout="wide", page_icon="📊")
@@ -118,13 +123,14 @@ sector_prices = sector_df["Close"] if not sector_df.empty else prices
 simple_r = prices.pct_change().dropna()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 Risk Scorecard",
     "📈 Volatility Surface",
     "⚠️ Tail Risk",
     "🔗 Relative Risk",
     "🌍 Macro Regime",
     "🧪 Backtester",
+    "📋 Fundamental Risk",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -186,6 +192,30 @@ with tab1:
 
     # Key summary metrics
     st.subheader("Summary Statistics")
+    # Divergence indicator (lazy — only shown if fundamental data already loaded)
+    if st.session_state.get("fund_scores"):
+        fs = st.session_state.fund_scores
+        mkt_score = total_score
+        fund_score = fs["total"]
+        div = abs(mkt_score - fund_score)
+        if div < 20:
+            div_color, div_label = "#2ecc71", "🟢 ALIGNED — Market and fundamental risk agree"
+        elif div < 40:
+            div_color, div_label = "#f39c12", "🟡 MILD DIVERGENCE — Signals mixed, monitor closely"
+        else:
+            div_color, div_label = "#e74c3c", "🔴 STRONG DIVERGENCE"
+            if mkt_score > fund_score:
+                div_label += " — Market may be OVERPRICING RISK (potential opportunity if fundamentals hold)"
+            else:
+                div_label += " — Market may be UNDERPRICING RISK (fundamentals deteriorating beneath calm surface)"
+        st.markdown(
+            f"<div style='background:{div_color}22;border-left:4px solid {div_color};"
+            f"padding:10px 16px;border-radius:4px;margin-bottom:12px'>"
+            f"<b style='color:{div_color}'>{div_label}</b><br>"
+            f"<small>Market Risk Score: {mkt_score:.0f} | Fundamental Risk Score: {fund_score:.0f} | Divergence: {div:.0f} pts</small>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
     mdd_data = max_drawdown(prices)
     var_data = historical_var_cvar(simple_r)
     m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -595,3 +625,235 @@ with tab6:
         st.dataframe(styler, use_container_width=True)
     else:
         st.info("No stress test data available for the selected period.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — FUNDAMENTAL RISK
+# ══════════════════════════════════════════════════════════════════════════════
+with tab7:
+    st.subheader(f"Fundamental Risk Analysis — {_ticker}")
+
+    with st.spinner("Loading fundamental data (this may take ~15s on first run)..."):
+        # Get latest FRED rate for ERP calculation
+        fred_rate = None
+        if not macro_df.empty and "DGS10" in macro_df.columns:
+            fred_rate = float(macro_df["DGS10"].dropna().iloc[-1])
+
+        # Get current macro regime for regime mismatch check
+        from risk.metrics import classify_macro_regime
+        macro_regimes = classify_macro_regime(macro_df) if not macro_df.empty else pd.Series(dtype=str)
+        current_regime = str(macro_regimes.iloc[-1]) if len(macro_regimes) > 0 else "MIXED"
+
+        val_r   = valuation_risk(_ticker, fred_dgs10=fred_rate)
+        bs_r    = balance_sheet_risk(_ticker)
+        eq_r    = earnings_quality(_ticker)
+        cf_r    = cashflow_risk(_ticker)
+        gv_r    = growth_value_classification(_ticker, macro_regime=current_regime)
+        fund_scores = composite_fundamental_score(val_r, bs_r, eq_r, cf_r, gv_r)
+        st.session_state.fund_scores = fund_scores
+
+        ticker_name = info.get("name", _ticker)
+        news_items  = fetch_material_news(_ticker, ticker_name=ticker_name)
+
+    # ── DIVERGENCE ALERT BANNER ───────────────────────────────────────────────
+    mkt_score  = composite_risk_score(prices, volume, bench_prices)["total"]
+    fund_total = fund_scores["total"]
+    div        = abs(mkt_score - fund_total)
+
+    if div < 20:
+        div_color = "#2ecc71"
+        div_text  = "🟢 ALIGNED — Market and fundamental risk agree"
+        div_detail = f"Both scores are within {div:.0f} pts of each other. No material divergence signal."
+    elif div < 40:
+        div_color = "#f39c12"
+        div_text  = "🟡 MILD DIVERGENCE — Signals mixed, monitor closely"
+        div_detail = f"Market Risk: {mkt_score:.0f} | Fundamental Risk: {fund_total:.0f} | Gap: {div:.0f} pts"
+    else:
+        div_color = "#e74c3c"
+        if mkt_score > fund_total:
+            div_text   = "🔴 STRONG DIVERGENCE — Market may be OVERPRICING RISK"
+            div_detail = (
+                f"Market Risk Score ({mkt_score:.0f}) >> Fundamental Score ({fund_total:.0f}). "
+                "Price action is unusually volatile/stressed relative to fundamentals. "
+                "Potential opportunity if business quality holds."
+            )
+        else:
+            div_text   = "🔴 STRONG DIVERGENCE — Market may be UNDERPRICING RISK"
+            div_detail = (
+                f"Fundamental Risk Score ({fund_total:.0f}) >> Market Risk Score ({mkt_score:.0f}). "
+                "Fundamentals are deteriorating beneath a calm price surface. "
+                "Consider reducing exposure or hedging."
+            )
+
+    st.markdown(
+        f"<div style='background:{div_color}22;border-left:5px solid {div_color};"
+        f"padding:14px 18px;border-radius:6px;margin-bottom:20px'>"
+        f"<div style='font-size:18px;font-weight:bold;color:{div_color}'>{div_text}</div>"
+        f"<div style='margin-top:6px;color:#ccc'>{div_detail}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Active flags
+    all_flags = fund_scores.get("all_flags", [])
+    if all_flags:
+        flag_str = "  ".join([f"`{f}`" for f in all_flags])
+        st.warning(f"**Active Risk Flags:** {flag_str}")
+
+    # ── FOUR SCORE CARDS ──────────────────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+
+    def _score_card(col, label, score, key_lines, flags):
+        color = "#2ecc71" if score < 33 else "#f39c12" if score < 66 else "#e74c3c"
+        flag_html = "".join(
+            f"<div style='font-size:11px;color:{color};margin-top:2px'>⚠ {f}</div>"
+            for f in flags
+        )
+        col.markdown(
+            f"<div style='background:#1e1e2e;border-radius:8px;padding:14px;"
+            f"border-top:3px solid {color}'>"
+            f"<div style='font-size:13px;color:#aaa'>{label}</div>"
+            f"<div style='font-size:36px;font-weight:bold;color:{color}'>{score:.0f}</div>"
+            f"{''.join(f'<div style=\"font-size:12px;color:#ccc\">{l}</div>' for l in key_lines)}"
+            f"{flag_html}</div>",
+            unsafe_allow_html=True,
+        )
+
+    def _fmt(v, fmt=".2f", suffix=""):
+        return f"{v:{fmt}}{suffix}" if not (v is None or (isinstance(v, float) and np.isnan(v))) else "N/A"
+
+    _score_card(c1, "Valuation Risk", val_r["score"],
+        [f"P/E: {_fmt(val_r['metrics']['trailingPE'])}",
+         f"Fwd P/E: {_fmt(val_r['metrics']['forwardPE'])}",
+         f"EV/EBITDA: {_fmt(val_r['metrics']['evToEbitda'])}",
+         f"ERP: {_fmt(val_r['equity_risk_premium'], '.2%')}"],
+        val_r["flags"])
+
+    _score_card(c2, "Balance Sheet Risk", bs_r["score"],
+        [f"Z-Score: {_fmt(bs_r['z_score'])}",
+         f"D/E: {_fmt(bs_r['debt_to_equity'])}",
+         f"Interest Cov: {_fmt(bs_r['interest_coverage'])}",
+         f"Current: {_fmt(bs_r['current_ratio'])}"],
+        bs_r["flags"])
+
+    _score_card(c3, "Earnings Quality", eq_r["score"],
+        [f"Accruals: {_fmt(eq_r['accruals_ratio'], '.2%')}",
+         f"Consec. Misses: {eq_r['consecutive_misses']}",
+         f"Rev Growth Std: {_fmt(eq_r['rev_growth_std'], '.2%')}"],
+        eq_r["flags"])
+
+    _score_card(c4, "Cash Flow Risk", cf_r["score"],
+        [f"FCF Yield: {_fmt(cf_r['fcf_yield'], '.2%')}",
+         f"Shareholder Yield: {_fmt(cf_r['shareholder_yield'], '.2%')}",
+         f"Neg FCF Streak: {cf_r['neg_fcf_streak']}y"],
+        cf_r["flags"])
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── GROWTH/VALUE + REGIME ─────────────────────────────────────────────────
+    gc1, gc2, gc3 = st.columns(3)
+    gc1.metric("Classification", gv_r["classification"])
+    gc2.metric("Regime Favors", gv_r["regime_favors"])
+    gc3.metric("P/E Sector Percentile", f"{_fmt(gv_r['pe_percentile'], '.0f')}th")
+    if "REGIME_MISMATCH" in gv_r["flags"]:
+        st.error(f"⚠️ REGIME MISMATCH: {gv_r['classification']} stock in {gv_r['macro_regime']} regime. "
+                 f"Regime currently favors {gv_r['regime_favors']} stocks.")
+
+    # ── PEER COMPARISON TABLE ─────────────────────────────────────────────────
+    st.subheader("Valuation vs Sector Peers")
+    peer_metrics = [
+        ("Trailing P/E",  "trailingPE",   val_r["metrics"]["trailingPE"],   val_r["peer_ranks"].get("trailingPE_pct")),
+        ("Forward P/E",   "forwardPE",    val_r["metrics"]["forwardPE"],    val_r["peer_ranks"].get("forwardPE_pct")),
+        ("Price/Book",    "priceToBook",  val_r["metrics"]["priceToBook"],  val_r["peer_ranks"].get("priceToBook_pct")),
+        ("Price/Sales",   "priceToSales", val_r["metrics"]["priceToSales"], val_r["peer_ranks"].get("priceToSales_pct")),
+        ("EV/EBITDA",     "evToEbitda",   val_r["metrics"]["evToEbitda"],   val_r["peer_ranks"].get("evToEbitda_pct")),
+        ("PEG Ratio",     "pegRatio",     val_r["metrics"]["pegRatio"],     None),
+    ]
+    peer_rows = []
+    for label, _, value, rank in peer_metrics:
+        peer_rows.append({
+            "Metric": label,
+            "Value": _fmt(value),
+            "Sector Percentile": f"{rank:.0f}th" if rank is not None and not np.isnan(rank) else "N/A",
+            "Signal": ("🔴 Expensive" if rank and rank > 75 else "🟢 Cheap" if rank and rank < 25 else "🟡 Neutral") if rank is not None and not np.isnan(rank) else "—",
+        })
+    st.dataframe(pd.DataFrame(peer_rows), use_container_width=True, hide_index=True)
+
+    # ── EARNINGS SURPRISE HISTORY ─────────────────────────────────────────────
+    st.subheader("Earnings Surprise History (last 8 quarters)")
+    if eq_r["surprise_history"]:
+        surp_df = pd.DataFrame(eq_r["surprise_history"])
+        fig_surp = go.Figure(go.Bar(
+            x=surp_df["date"],
+            y=surp_df["surprise_pct"] * 100,
+            marker_color=["#2ecc71" if b else "#e74c3c" for b in surp_df["beat"]],
+            text=[f"{v:.1f}%" for v in surp_df["surprise_pct"] * 100],
+            textposition="outside",
+            name="EPS Surprise %",
+        ))
+        fig_surp.add_hline(y=0, line_color="white", line_dash="dot")
+        fig_surp.update_layout(
+            title="EPS Surprise % (positive = beat, negative = miss)",
+            yaxis_title="Surprise %", template=DARK, height=300,
+        )
+        st.plotly_chart(fig_surp, use_container_width=True)
+    else:
+        st.info("No earnings surprise data available.")
+
+    # ── FCF WATERFALL ────────────────────────────────────────────────────────
+    st.subheader("Free Cash Flow — 4-Year Trend")
+    if any(not np.isnan(f) for f in cf_r["annual_fcf"]):
+        n_years = min(4, len(cf_r["annual_fcf"]))
+        year_labels = [f"Y-{i}" for i in range(n_years - 1, -1, -1)]
+        fcf_vals = [f / 1e9 if not np.isnan(f) else 0 for f in cf_r["annual_fcf"][:n_years]][::-1]
+        margins  = [m * 100 if m is not None and not np.isnan(m) else None for m in cf_r["fcf_margins"][:n_years]][::-1]
+
+        fig_fcf = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_fcf.add_trace(go.Bar(
+            x=year_labels, y=fcf_vals,
+            name="FCF ($B)",
+            marker_color=["#2ecc71" if v >= 0 else "#e74c3c" for v in fcf_vals],
+        ), secondary_y=False)
+        valid_margins = [(l, m) for l, m in zip(year_labels, margins) if m is not None]
+        if valid_margins:
+            fig_fcf.add_trace(go.Scatter(
+                x=[l for l, _ in valid_margins],
+                y=[m for _, m in valid_margins],
+                name="FCF Margin %", mode="lines+markers",
+                line=dict(color="#3498db", width=2),
+            ), secondary_y=True)
+        fig_fcf.update_layout(title="Free Cash Flow & Margin", template=DARK, height=300)
+        fig_fcf.update_yaxes(title_text="FCF ($B)", secondary_y=False)
+        fig_fcf.update_yaxes(title_text="FCF Margin %", secondary_y=True)
+        st.plotly_chart(fig_fcf, use_container_width=True)
+    else:
+        st.info("FCF data unavailable.")
+
+    # ── MATERIAL NEWS FEED ───────────────────────────────────────────────────
+    st.subheader("Material News")
+    if news_items:
+        SENTIMENT_COLOR = {
+            "POSITIVE": "#2ecc71",
+            "NEGATIVE": "#e74c3c",
+            "NEUTRAL": "#95a5a6",
+            "MIXED": "#f39c12",
+        }
+        for category in ["Company News", "Sector News", "Macro News"]:
+            cat_items = [n for n in news_items if n["category"] == category]
+            if not cat_items:
+                continue
+            st.markdown(f"**{category}**")
+            for item in cat_items:
+                sc = item["sentiment"]
+                color = SENTIMENT_COLOR.get(sc, "#95a5a6")
+                stars = "★" * item["materiality"] + "☆" * (3 - item["materiality"])
+                title_display = f"[{item['title']}]({item['url']})" if item["url"] else item["title"]
+                st.markdown(
+                    f"<div style='border-left:3px solid {color};padding:6px 12px;margin-bottom:6px;background:#1a1a2e;border-radius:0 4px 4px 0'>"
+                    f"<span style='color:{color};font-size:11px'>{sc}</span> "
+                    f"<span style='color:#888;font-size:11px'>{stars} · {item['date']} · {item['source']}</span><br>"
+                    f"<span style='font-size:13px'>{title_display}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.info("No material news found for this ticker.")

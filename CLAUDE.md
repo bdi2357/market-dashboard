@@ -108,3 +108,62 @@ All parquet cache files live in `data/cache/` (gitignored). Cache TTL: 4h for pr
 
 ## Environment Variables
 - `FRED_API_KEY` — optional; without it, macro data falls back to `pandas-datareader` FRED reader (rate-limited but functional)
+
+### Fundamental Risk Engine (`risk/fundamental.py`)
+
+#### Valuation Risk
+| Metric | Formula | Concern Threshold |
+|--------|---------|-------------------|
+| Trailing P/E | Price / TTM EPS | >80th sector percentile = expensive |
+| Forward P/E | Price / NTM EPS estimate | >80th pct + high = priced for perfection |
+| Price/Book | Market Cap / Book Value | >80th pct = stretched for financials/industrials |
+| EV/EBITDA | Enterprise Value / EBITDA | >15× = high; >20× = very high |
+| PEG Ratio | P/E / EPS Growth Rate | >2 = growth fully priced in |
+| Equity Risk Premium | Earnings Yield - 10Y Treasury yield | <1% = bonds competitive vs equities |
+
+Flag `VALUATION_STRETCHED`: above 80th sector percentile on 3+ of the above metrics.
+
+#### Balance Sheet Risk — Altman Z-Score
+Z = 1.2×(Working Capital/Assets) + 1.4×(Retained Earnings/Assets) + 3.3×(EBIT/Assets) + 0.6×(Mkt Cap/Total Liab) + 1.0×(Revenue/Assets)
+- Z > 2.99: Safe zone
+- 1.81 ≤ Z < 2.99: Grey zone — monitor
+- Z < 1.81: Distress zone — flag `ALTMAN_DISTRESS`
+
+Other thresholds: Interest Coverage < 2× → `INTEREST_COVERAGE_LOW`; Total Debt YoY > 20% → `DEBT_SURGE`
+
+#### Earnings Quality
+| Metric | Formula | Concern Threshold |
+|--------|---------|-------------------|
+| Accruals Ratio | (Net Income - CFO) / Total Assets | >5% = low quality; earnings exceed cash |
+| EPS Surprise Trend | Actual vs consensus estimate | 2+ consecutive misses = `CONSECUTIVE_MISSES` |
+| Revenue Growth Std | Std dev of quarterly revenue growth | High std dev = lumpy, unreliable revenue |
+
+#### Cash Flow Risk
+| Metric | Formula | Concern Threshold |
+|--------|---------|-------------------|
+| FCF | Operating CF - CapEx | Negative for 2+ years = `FCF_NEGATIVE_STREAK` |
+| FCF Yield | FCF / Market Cap | <0% while P/E >20 = `FCF_YIELD_NEGATIVE_PREMIUM` |
+| FCF Volatility | std(annual FCF) / mean(FCF) | >1.0 = highly unpredictable cash generation |
+| Shareholder Yield | FCF yield + dividend yield + buyback yield | Higher = more capital returned to shareholders |
+
+#### Growth/Value + Regime Classification
+Stock is classified into: Deep Value / Value / Blend / Growth / Aggressive Growth
+based on sector P/E percentile and revenue growth rate.
+
+Regime mismatch flags (`REGIME_MISMATCH`):
+- Aggressive Growth in RISK_OFF or STAGFLATION_PROXY regime
+- Deep Value in RISK_ON regime (mild — opportunity signal)
+
+#### Divergence Score (Market Risk vs Fundamental Risk)
+divergence = |composite_risk_score - composite_fundamental_score|
+- <20: Aligned
+- 20-40: Mild divergence — monitor
+- >40: Strong divergence — actionable signal:
+  - Market risk high + Fundamental risk low → market overpricing risk
+  - Market risk low + Fundamental risk high → market underpricing risk (most dangerous)
+
+#### News Materiality Scoring
+Headlines scored 1-3; only 2-3 shown in the feed.
+Score 3: Earnings results, M&A, CEO change, regulatory action, credit rating change, FCF/dividend change
+Score 2: Analyst upgrades/downgrades, price target changes, macro events with sector impact
+Score 1 (filtered): Generic price commentary, listicles, unrelated news
