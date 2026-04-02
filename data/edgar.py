@@ -170,30 +170,37 @@ def fetch_insider_transactions(ticker: str, days_back: int = 180) -> pd.DataFram
     accessions = filings.get("accessionNumber", [])
     dates = filings.get("filingDate", [])
 
+    primary_docs = filings.get("primaryDocument", [])
     cutoff = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+
+    # Include primaryDocument so we can build the XML URL directly —
+    # avoids fetching index pages and guessing filenames like "form4.xml"
     form4_entries = [
-        (acc, dt) for form, acc, dt in zip(forms, accessions, dates)
+        (acc, dt, doc)
+        for form, acc, dt, doc in zip(forms, accessions, dates, primary_docs)
         if form == "4" and dt >= cutoff
     ]
 
+    cik_int = int(cik)
     rows = []
-    for accession, filing_date in form4_entries[:50]:  # cap at 50 recent filings
+    for accession, filing_date, primary_doc in form4_entries[:60]:
         acc_clean = accession.replace("-", "")
-        xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/{accession}.txt"
-        # Try to find the XML document
-        index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/{accession}-index.htm"
-        index_text = _get_text(index_url)
 
+        # Build URL directly from primaryDocument (e.g. wf-form4_1234.xml)
         xml_link = None
-        if index_text:
-            # Find the Form 4 XML in the index
+        if primary_doc and primary_doc.lower().endswith(".xml"):
+            xml_link = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_clean}/{primary_doc}"
+
+        # Fallback: scan the filing index for the first XML
+        if not xml_link:
+            index_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_clean}/{accession}-index.htm"
+            index_text = _get_text(index_url) or ""
             m = re.search(r'href="(/Archives/edgar/data/[^"]+\.xml)"', index_text, re.IGNORECASE)
             if m:
                 xml_link = "https://www.sec.gov" + m.group(1)
 
         if not xml_link:
-            # Fallback: construct common Form 4 XML filename
-            xml_link = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/form4.xml"
+            continue
 
         xml_text = _get_text(xml_link)
         if not xml_text or "<ownershipDocument>" not in xml_text:
@@ -322,13 +329,13 @@ def compute_insider_signals(df: pd.DataFrame) -> dict:
     n_sells = (~last90["is_buy"]).sum()
     bsr = n_buys / (n_buys + n_sells) if (n_buys + n_sells) > 0 else np.nan
 
-    # Cluster detection: 3+ unique insiders same direction in 10 trading days
+    # Cluster detection: 3+ unique insiders same direction within 90 days
     cluster_signal = None
     cluster_insiders = []
-    last30 = df[df["date"] >= (now - pd.Timedelta(days=30))]
-    if not last30.empty:
-        buy_names = last30[last30["is_buy"]]["name"].unique().tolist()
-        sell_names = last30[~last30["is_buy"]]["name"].unique().tolist()
+    last90_cluster = df[df["date"] >= (now - pd.Timedelta(days=90))]
+    if not last90_cluster.empty:
+        buy_names = last90_cluster[last90_cluster["is_buy"]]["name"].unique().tolist()
+        sell_names = last90_cluster[~last90_cluster["is_buy"]]["name"].unique().tolist()
         if len(buy_names) >= 3:
             cluster_signal = "BUY"
             cluster_insiders = buy_names
@@ -353,18 +360,24 @@ def compute_insider_signals(df: pd.DataFrame) -> dict:
     }
 
 
-# ── PART 3: 13F HEDGE FUND HOLDINGS ──────────────────────────────────────────
+# ── PART 3: 13F INSTITUTIONAL HOLDINGS ───────────────────────────────────────
+
+# Snapshot cache path for QoQ comparison
+_INST_SNAPSHOT_DIR = CACHE_DIR / "inst_snapshots"
+_INST_SNAPSHOT_DIR.mkdir(exist_ok=True)
+
 
 def fetch_institutional_changes(ticker: str) -> pd.DataFrame:
     """
-    Use yfinance institutional_holders as seed, then fetch 13F data from EDGAR
-    for a curated list of large funds to find position changes in the target ticker.
+    Primary source: yfinance institutional_holders (reliable, always works).
+    QoQ change: compare current snapshot to the previous one saved to disk.
 
-    Returns DataFrame: fund_name, cik, prev_shares, curr_shares, change_shares,
-    change_pct, curr_value, pct_of_portfolio, signal (NEW/ADDED/REDUCED/CLOSED)
+    Returns DataFrame with columns:
+    fund_name, date_reported, curr_shares, prev_shares, change_shares,
+    change_pct, curr_value, pct_out, signal
     """
     cache_key = f"13f_{ticker}"
-    cached = _load_df_cache(cache_key, max_age_hours=168)  # refresh weekly
+    cached = _load_df_cache(cache_key, max_age_hours=168)
     if cached is not None:
         return cached
 
@@ -372,194 +385,81 @@ def fetch_institutional_changes(ticker: str) -> pd.DataFrame:
     t = yf.Ticker(ticker)
     inst = t.institutional_holders
 
-    # Seed fund names from yfinance
-    seed_funds = []
-    if inst is not None and not inst.empty:
-        holder_col = "Holder" if "Holder" in inst.columns else inst.columns[0]
-        seed_funds = inst[holder_col].dropna().tolist()[:15]
-
-    # Well-known fund CIKs (pre-resolved, reliable)
-    KNOWN_FUND_CIKS = {
-        "Vanguard Group": "0000102909",
-        "BlackRock": "0001364742",
-        "State Street": "0000093751",
-        "Fidelity": "0000315066",
-        "T. Rowe Price": "0001113169",
-        "Invesco": "0000914203",
-        "JPMorgan": "0000019617",
-        "Goldman Sachs": "0000886982",
-        "Morgan Stanley": "0000895421",
-        "Wellington Management": "0000101899",
-    }
-
-    rows = []
-    for fund_name, fund_cik in list(KNOWN_FUND_CIKS.items())[:8]:
-        try:
-            result = _fetch_13f_for_fund(fund_cik, fund_name, ticker)
-            if result:
-                rows.append(result)
-        except Exception:
-            continue
-
-    if not rows:
+    if inst is None or inst.empty:
         return pd.DataFrame()
 
+    # Normalise column names (yfinance can vary)
+    inst = inst.copy()
+    col_map = {}
+    for c in inst.columns:
+        cl = c.lower().replace(" ", "_")
+        if "holder" in cl:
+            col_map[c] = "fund_name"
+        elif "shares" in cl:
+            col_map[c] = "curr_shares"
+        elif "date" in cl:
+            col_map[c] = "date_reported"
+        elif "%" in c or "out" in cl:
+            col_map[c] = "pct_out"
+        elif "value" in cl:
+            col_map[c] = "curr_value"
+    inst = inst.rename(columns=col_map)
+
+    for col in ["fund_name", "curr_shares", "date_reported", "pct_out", "curr_value"]:
+        if col not in inst.columns:
+            inst[col] = np.nan
+
+    # Load previous snapshot for QoQ comparison
+    snap_path = _INST_SNAPSHOT_DIR / f"{ticker.upper()}_prev.parquet"
+    prev_map: dict[str, int] = {}
+    if snap_path.exists():
+        try:
+            prev_df = pd.read_parquet(snap_path)
+            if "fund_name" in prev_df.columns and "curr_shares" in prev_df.columns:
+                prev_map = dict(zip(prev_df["fund_name"].astype(str), prev_df["curr_shares"].fillna(0).astype(int)))
+        except Exception:
+            pass
+
+    # Save current as new snapshot (overwrite)
+    try:
+        inst.to_parquet(snap_path)
+    except Exception:
+        pass
+
+    rows = []
+    for _, row in inst.iterrows():
+        name = str(row.get("fund_name", "Unknown"))
+        curr = int(row.get("curr_shares", 0) or 0)
+        prev = prev_map.get(name, 0)
+        change = curr - prev
+
+        if prev == 0 and curr > 0:
+            signal = "NEW" if name not in prev_map else "UNCHANGED"
+        elif curr == 0 and prev > 0:
+            signal = "CLOSED"
+        elif change > curr * 0.01:    # >1% increase
+            signal = "ADDED"
+        elif change < -curr * 0.01:   # >1% decrease
+            signal = "REDUCED"
+        else:
+            signal = "UNCHANGED"
+
+        rows.append({
+            "fund_name": name,
+            "date_reported": row.get("date_reported", ""),
+            "curr_shares": curr,
+            "prev_shares": prev,
+            "change_shares": change,
+            "change_pct": (change / prev * 100) if prev > 0 else None,
+            "curr_value": float(row.get("curr_value", 0) or 0),
+            "pct_out": float(row.get("pct_out", 0) or 0),
+            "signal": signal,
+        })
+
     df = pd.DataFrame(rows)
-    _save_df_cache(cache_key, df)
+    if not df.empty:
+        _save_df_cache(cache_key, df)
     return df
-
-
-def _fetch_13f_for_fund(cik: str, fund_name: str, target_ticker: str) -> Optional[dict]:
-    """
-    Fetch latest 2 quarters of 13F for a fund and find position in target_ticker.
-    Returns dict with position data or None if not found.
-    """
-    submissions = get_submissions(cik.zfill(10))
-    if not submissions:
-        return None
-
-    filings = submissions.get("filings", {}).get("recent", {})
-    if not filings:
-        return None
-
-    forms = filings.get("form", [])
-    accessions = filings.get("accessionNumber", [])
-    dates = filings.get("filingDate", [])
-    descriptions = filings.get("primaryDocument", [])
-
-    # Get last 2 13F-HR filings
-    thirteenf_entries = [
-        (acc, dt, doc)
-        for form, acc, dt, doc in zip(forms, accessions, dates, descriptions)
-        if "13F-HR" in str(form)
-    ][:2]
-
-    if not thirteenf_entries:
-        return None
-
-    quarters = []
-    for accession, filing_date, primary_doc in thirteenf_entries:
-        shares, value = _parse_13f_holding(cik.zfill(10), accession, target_ticker)
-        if shares is not None:
-            quarters.append({"date": filing_date, "shares": shares, "value": value})
-
-    if not quarters:
-        return None
-
-    curr = quarters[0]
-    prev = quarters[1] if len(quarters) > 1 else {"shares": 0, "value": 0}
-
-    change_shares = curr["shares"] - prev["shares"]
-    change_pct = change_shares / prev["shares"] * 100 if prev["shares"] > 0 else None
-
-    if prev["shares"] == 0 and curr["shares"] > 0:
-        signal = "NEW"
-    elif curr["shares"] == 0 and prev["shares"] > 0:
-        signal = "CLOSED"
-    elif change_shares > 0:
-        signal = "ADDED"
-    elif change_shares < 0:
-        signal = "REDUCED"
-    else:
-        signal = "UNCHANGED"
-
-    return {
-        "fund_name": fund_name,
-        "cik": cik,
-        "filing_date": curr["date"],
-        "curr_shares": curr["shares"],
-        "prev_shares": prev["shares"],
-        "change_shares": change_shares,
-        "change_pct": change_pct,
-        "curr_value": curr["value"],
-        "signal": signal,
-    }
-
-
-def _parse_13f_holding(cik: str, accession: str, target_ticker: str) -> tuple[Optional[int], Optional[float]]:
-    """
-    Parse 13F XML to find shares and value held for target_ticker.
-    Returns (shares, value) or (None, None).
-    """
-    acc_clean = accession.replace("-", "")
-    # Try to get the index to find the infotable XML
-    index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/{accession}-index.htm"
-    index_text = _get_text(index_url)
-    if not index_text:
-        return None, None
-
-    # Find infotable or primary_doc XML
-    xml_links = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', index_text, re.IGNORECASE)
-    # Prefer the information table (usually the 2nd XML file)
-    infotable_link = None
-    for link in xml_links:
-        if "infotable" in link.lower() or "form13f" in link.lower():
-            infotable_link = "https://www.sec.gov" + link
-            break
-    if not infotable_link and xml_links:
-        infotable_link = "https://www.sec.gov" + xml_links[-1]  # last XML usually infotable
-
-    if not infotable_link:
-        return None, None
-
-    xml_text = _get_text(infotable_link)
-    if not xml_text:
-        return None, None
-
-    # Search for target ticker in holding entries
-    ticker_upper = target_ticker.upper()
-    # Common XBRL patterns for 13F info table entries
-    # Match either <nameOfIssuer> blocks containing the ticker/company
-    entries = re.findall(
-        r"<infoTable>(.*?)</infoTable>",
-        xml_text, re.S | re.IGNORECASE,
-    )
-    if not entries:
-        entries = re.findall(r"<ns1:infoTable>(.*?)</ns1:infoTable>", xml_text, re.S | re.IGNORECASE)
-
-    for entry in entries:
-        name_m = re.search(r"<nameOfIssuer>(.*?)</nameOfIssuer>", entry, re.S | re.IGNORECASE)
-        if not name_m:
-            name_m = re.search(r"<ns1:nameOfIssuer>(.*?)</ns1:nameOfIssuer>", entry, re.S | re.IGNORECASE)
-        if not name_m:
-            continue
-        issuer = name_m.group(1).strip().upper()
-        # Fuzzy match: ticker appears in name or exact ticker match
-        if ticker_upper not in issuer and not _ticker_matches_issuer(ticker_upper, issuer):
-            continue
-
-        shares_m = re.search(r"<sshPrnamt>([\d,]+)</sshPrnamt>", entry, re.S | re.IGNORECASE)
-        if not shares_m:
-            shares_m = re.search(r"<ns1:sshPrnamt>([\d,]+)</ns1:sshPrnamt>", entry, re.S | re.IGNORECASE)
-        value_m = re.search(r"<value>([\d,]+)</value>", entry, re.S | re.IGNORECASE)
-        if not value_m:
-            value_m = re.search(r"<ns1:value>([\d,]+)</ns1:value>", entry, re.S | re.IGNORECASE)
-
-        shares = int(shares_m.group(1).replace(",", "")) if shares_m else 0
-        value = float(value_m.group(1).replace(",", "")) * 1000 if value_m else 0  # 13F values in $thousands
-        return shares, value
-
-    return None, None
-
-
-# Map of common ticker → company name fragments for 13F matching
-_TICKER_ISSUER_MAP = {
-    "AAL": ["AMERICAN AIRLINES"],
-    "DAL": ["DELTA AIR"],
-    "UAL": ["UNITED AIRLINES"],
-    "AAPL": ["APPLE"],
-    "MSFT": ["MICROSOFT"],
-    "GOOGL": ["ALPHABET", "GOOGLE"],
-    "AMZN": ["AMAZON"],
-    "TSLA": ["TESLA"],
-    "NVDA": ["NVIDIA"],
-    "META": ["META PLATFORMS", "FACEBOOK"],
-}
-
-
-def _ticker_matches_issuer(ticker: str, issuer_upper: str) -> bool:
-    fragments = _TICKER_ISSUER_MAP.get(ticker, [ticker])
-    return any(frag in issuer_upper for frag in fragments)
 
 
 def compute_institutional_signals(df: pd.DataFrame) -> dict:
