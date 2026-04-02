@@ -708,13 +708,15 @@ with tab7:
             f"<div style='font-size:11px;color:{color};margin-top:2px'>⚠ {f}</div>"
             for f in flags
         )
+        lines_html = "".join(
+            f"<div style='font-size:12px;color:#ccc'>{l}</div>" for l in key_lines
+        )
         col.markdown(
             f"<div style='background:#1e1e2e;border-radius:8px;padding:14px;"
             f"border-top:3px solid {color}'>"
             f"<div style='font-size:13px;color:#aaa'>{label}</div>"
             f"<div style='font-size:36px;font-weight:bold;color:{color}'>{score:.0f}</div>"
-            f"{''.join(f'<div style=\"font-size:12px;color:#ccc\">{l}</div>' for l in key_lines)}"
-            f"{flag_html}</div>",
+            f"{lines_html}{flag_html}</div>",
             unsafe_allow_html=True,
         )
 
