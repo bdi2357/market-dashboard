@@ -7,6 +7,7 @@ Data fetching layer.
 """
 
 import os
+import re
 import hashlib
 import pandas as pd
 import numpy as np
@@ -17,6 +18,29 @@ from typing import Optional
 
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
+
+# Path to secrets.toml relative to this file (../../.streamlit/secrets.toml)
+_SECRETS_PATH = Path(__file__).parent.parent / ".streamlit" / "secrets.toml"
+
+
+def _get_fred_key() -> str:
+    """
+    Return FRED API key from (in order):
+    1. FRED_API_KEY environment variable
+    2. .streamlit/secrets.toml  (parsed directly — no Streamlit dependency)
+    """
+    key = os.environ.get("FRED_API_KEY", "")
+    if key:
+        return key
+    if _SECRETS_PATH.exists():
+        try:
+            text = _SECRETS_PATH.read_text(encoding="utf-8")
+            m = re.search(r'FRED_API_KEY\s*=\s*["\']([^"\']+)["\']', text)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+    return ""
 
 # FRED series used by macro regime module
 FRED_SERIES = {
@@ -114,7 +138,7 @@ def fetch_macro(start: date, end: date) -> pd.DataFrame:
     if cached is not None:
         return cached
 
-    fred_key = os.environ.get("FRED_API_KEY", "")
+    fred_key = _get_fred_key()
     frames = {}
 
     if fred_key:
