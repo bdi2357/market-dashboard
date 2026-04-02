@@ -1471,9 +1471,9 @@ with tab8:
             lambda v: f"{v:+,.0f}" if pd.notna(v) else "N/A"
         )
         st.dataframe(
-            _inst_display[["fund_name", "filing_date", "curr_shares", "change_shares_fmt",
+            _inst_display[["fund_name", "date_reported", "curr_shares", "change_shares_fmt",
                            "change_pct_fmt", "curr_value_fmt", "signal"]].rename(columns={
-                "fund_name": "Fund", "filing_date": "Filed",
+                "fund_name": "Fund", "date_reported": "Filed",
                 "curr_shares": "Current Shares", "change_shares_fmt": "Change",
                 "change_pct_fmt": "Change %", "curr_value_fmt": "Market Value",
                 "signal": "Signal",
