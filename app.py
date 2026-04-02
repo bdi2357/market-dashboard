@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import date, timedelta
+import yfinance as yf
 
 # Inject FRED API key from Streamlit secrets into the environment so
 # data/fetcher.py (which reads os.environ) can find it without requiring
@@ -80,23 +81,33 @@ if "data_loaded" not in st.session_state:
     st.session_state.data_loaded = False
 
 if load:
-    with st.spinner("Fetching data..."):
-        df = fetch_ohlcv(ticker, start_date, end_date)
-        bench_df = fetch_ohlcv(benchmark, start_date, end_date)
-        info = fetch_ticker_info(ticker)
-        sector_etf = get_sector_etf(ticker)
-        sector_df = fetch_ohlcv(sector_etf, start_date, end_date)
-        macro_df = fetch_macro(start_date, end_date)
+    _progress = st.progress(0, text="Fetching price data...")
+    df = fetch_ohlcv(ticker, start_date, end_date)
+    _progress.progress(20, text="Fetching benchmark data...")
+    bench_df = fetch_ohlcv(benchmark, start_date, end_date)
+    _progress.progress(35, text="Fetching ticker metadata...")
+    info = fetch_ticker_info(ticker)
+    sector_etf = get_sector_etf(ticker)
+    _progress.progress(50, text=f"Fetching sector ETF ({sector_etf})...")
+    sector_df = fetch_ohlcv(sector_etf, start_date, end_date)
+    _progress.progress(70, text="Fetching FRED macro data (DGS10, VIX, spreads)...")
+    macro_df = fetch_macro(start_date, end_date)
+    _progress.progress(100, text="Done.")
+    _progress.empty()
 
-        st.session_state.df = df
-        st.session_state.bench_df = bench_df
-        st.session_state.sector_df = sector_df
-        st.session_state.macro_df = macro_df
-        st.session_state.info = info
-        st.session_state.sector_etf = sector_etf
-        st.session_state.data_loaded = True
-        st.session_state.ticker = ticker
-        st.session_state.benchmark = benchmark
+    st.session_state.df = df
+    st.session_state.bench_df = bench_df
+    st.session_state.sector_df = sector_df
+    st.session_state.macro_df = macro_df
+    st.session_state.info = info
+    st.session_state.sector_etf = sector_etf
+    st.session_state.data_loaded = True
+    st.session_state.ticker = ticker
+    st.session_state.benchmark = benchmark
+    # Clear stale cached computations when new data is loaded
+    for _k in list(st.session_state.keys()):
+        if _k.startswith("bt_") or _k.startswith("fund_"):
+            del st.session_state[_k]
 
 if not st.session_state.data_loaded:
     st.info("Configure settings in the sidebar and click **Load Data** to begin.")
@@ -138,6 +149,66 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
     st.subheader(f"Risk Scorecard — {_ticker}")
+
+    # ── RISK ALERTS ───────────────────────────────────────────────────────────
+    _r_alerts = []
+    _kurt = simple_r.kurtosis()
+    _skew = simple_r.skew()
+    _ann_vol_alert = simple_r.std() * np.sqrt(252)
+    _ann_ret_alert = (1 + simple_r.mean()) ** 252 - 1
+    _mdd_alert = max_drawdown(prices)["max_drawdown"]
+    _calmar_alert = calmar_ratio(prices)
+    _var_data_alert = historical_var_cvar(simple_r)
+    _cvar99_alert = _var_data_alert["cvar_99"]
+
+    if _kurt > 5:
+        _adj = (1 + (_kurt / 3) * 0.15)
+        _r_alerts.append(("🔴", "EXTREME FAT TAILS",
+            f"Excess kurtosis {_kurt:.2f} — normal VaR underestimates true tail risk by ~{(_adj-1)*100:.0f}%. "
+            f"Cornish-Fisher adjustment is essential for this asset.",
+            "#e74c3c"))
+    elif _kurt > 3:
+        _r_alerts.append(("🟠", "FAT TAILS",
+            f"Excess kurtosis {_kurt:.2f} > 3 — return distribution has heavier tails than normal.",
+            "#e67e22"))
+
+    if _cvar99_alert > 0.10:
+        _r_alerts.append(("🔴", "SEVERE TAIL RISK",
+            f"CVaR 99% = {_cvar99_alert:.2%} — worst 1% of trading days average a {_cvar99_alert:.2%} loss. "
+            f"Threshold: >10%.",
+            "#e74c3c"))
+
+    if _mdd_alert < -0.40:
+        _r_alerts.append(("🟠", "DEEP DRAWDOWN HISTORY",
+            f"Max drawdown = {_mdd_alert:.1%} — asset has experienced severe capital destruction. "
+            f"Threshold: < -40%.",
+            "#e67e22"))
+
+    if not np.isnan(_calmar_alert) and _calmar_alert < 0.10:
+        _r_alerts.append(("🟠", "POOR RISK-ADJUSTED RETURN",
+            f"Calmar ratio = {_calmar_alert:.3f} — annualized return barely compensates for drawdown risk. "
+            f"Threshold: < 0.10.",
+            "#e67e22"))
+
+    if _ann_vol_alert > 0.40:
+        _r_alerts.append(("🟡", "HIGH VOLATILITY ASSET",
+            f"Annualized vol = {_ann_vol_alert:.1%} — significantly above typical equity range (15-25%). "
+            f"Threshold: > 40%.",
+            "#f39c12"))
+
+    if _r_alerts:
+        st.markdown("**⚠️ Active Risk Alerts**")
+        for icon, title, msg, color in _r_alerts:
+            st.markdown(
+                f"<div style='background:{color}22;border-left:4px solid {color};"
+                f"padding:8px 14px;border-radius:4px;margin-bottom:6px'>"
+                f"<b style='color:{color}'>{icon} {title}</b><br>"
+                f"<span style='font-size:13px;color:#ddd'>{msg}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        st.markdown("")
+
     col_info, col_score = st.columns([1, 1])
 
     with col_info:
@@ -171,11 +242,47 @@ with tab1:
         gauge.update_layout(height=250, template=DARK, margin=dict(t=30, b=10))
         st.plotly_chart(gauge, use_container_width=True)
 
-    # Component breakdown
-    comp_df = pd.DataFrame(
-        [(k, v / 0.01 if k == list(components.keys())[0] else v, v) for k, v in components.items()],
-        columns=["Factor", "_raw", "Weighted Score"],
-    )
+    # ── DUAL GAUGE: Market Risk vs Fundamental Risk ───────────────────────────
+    _fund_score_val = st.session_state.fund_scores["total"] if st.session_state.get("fund_scores") else None
+    _gauge_cols = st.columns(2 if _fund_score_val is not None else 1)
+
+    def _make_gauge(title, value, height=260):
+        _gc = "#2ecc71" if value < 30 else "#f39c12" if value < 60 else "#e67e22" if value < 80 else "#e74c3c"
+        _fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=value,
+            title={"text": title, "font": {"size": 14}},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": _gc},
+                "steps": [
+                    {"range": [0, 30],  "color": "#0d2b0d"},
+                    {"range": [30, 60], "color": "#2b1f00"},
+                    {"range": [60, 80], "color": "#2b0f00"},
+                    {"range": [80, 100],"color": "#1a0000"},
+                ],
+            },
+        ))
+        _fig.update_layout(height=height, template=DARK, margin=dict(t=40, b=10, l=20, r=20))
+        return _fig
+
+    with _gauge_cols[0]:
+        st.plotly_chart(_make_gauge("Market Risk Score", total_score), use_container_width=True)
+    if _fund_score_val is not None:
+        with _gauge_cols[1]:
+            st.plotly_chart(_make_gauge("Fundamental Risk Score", _fund_score_val), use_container_width=True)
+        _div_val = abs(total_score - _fund_score_val)
+        _div_c = "#2ecc71" if _div_val < 20 else "#f39c12" if _div_val < 40 else "#e74c3c"
+        st.markdown(
+            f"<div style='text-align:center;padding:6px;background:{_div_c}22;"
+            f"border-radius:4px;margin-bottom:12px'>"
+            f"<b style='color:{_div_c}'>Divergence: {_div_val:.0f} pts</b> — "
+            f"{'Aligned' if _div_val < 20 else 'Mild divergence' if _div_val < 40 else 'Strong divergence — see Fundamental Risk tab'}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Component breakdown bar chart
     comp_names = list(components.keys())
     comp_values = [components[k] for k in comp_names]
     fig_bar = go.Figure(go.Bar(
@@ -253,8 +360,9 @@ with tab2:
         label = col.replace("vol_", "").replace("d", "d Realized Vol")
         fig_vol.add_trace(go.Scatter(x=vol_df.index, y=vol_df[col], name=label, line=dict(color=color)))
 
-    # Percentile bands for 21d vol
+    # Percentile bands for 21d vol + spike annotations
     v21 = vol_df["vol_21d"].dropna()
+    p95 = pd.Series(dtype=float)
     if len(v21) > 40:
         p25 = v21.rolling(252, min_periods=60).quantile(0.25)
         p75 = v21.rolling(252, min_periods=60).quantile(0.75)
@@ -263,8 +371,82 @@ with tab2:
         fig_vol.add_trace(go.Scatter(x=v21.index, y=p75, name="75th pct (21d)", line=dict(color="gray", dash="dot", width=1)))
         fig_vol.add_trace(go.Scatter(x=v21.index, y=p25, name="25th pct (21d)", line=dict(color="gray", dash="dot", width=1), fill="tonexty", fillcolor="rgba(100,100,100,0.1)"))
 
-    fig_vol.update_layout(title="Realized Volatility Cone", yaxis_title="Annualized Vol", template=DARK, height=400)
+        # Detect spikes: 10d vol > 95th pct of its own history, group into events
+        v10 = vol_df["vol_10d"].dropna()
+        p95_10 = v10.rolling(252, min_periods=60).quantile(0.95)
+        spike_mask = v10 > p95_10
+        spike_events = []
+        in_spike = False
+        spike_start = None
+        spike_peak_val = 0
+        spike_peak_date = None
+        for dt in v10.index:
+            if spike_mask.get(dt, False):
+                if not in_spike:
+                    in_spike = True
+                    spike_start = dt
+                    spike_peak_val = v10[dt]
+                    spike_peak_date = dt
+                elif v10[dt] > spike_peak_val:
+                    spike_peak_val = v10[dt]
+                    spike_peak_date = dt
+            else:
+                if in_spike:
+                    spike_events.append((spike_peak_date, spike_peak_val, p95_10.get(spike_peak_date, spike_peak_val)))
+                    in_spike = False
+        if in_spike:
+            spike_events.append((spike_peak_date, spike_peak_val, p95_10.get(spike_peak_date, spike_peak_val)))
+
+        # Annotate top-5 spikes by magnitude
+        spike_events.sort(key=lambda x: x[1], reverse=True)
+        for sp_date, sp_val, sp_p95 in spike_events[:5]:
+            pct_above = (sp_val / sp_p95 - 1) * 100 if sp_p95 > 0 else 0
+            fig_vol.add_annotation(
+                x=sp_date, y=sp_val,
+                text=f"Spike +{pct_above:.0f}% above 95th",
+                showarrow=True, arrowhead=2, arrowcolor="#e74c3c",
+                font=dict(size=10, color="#e74c3c"),
+                bgcolor="rgba(30,30,46,0.85)",
+                yshift=10,
+            )
+
+    fig_vol.update_layout(title="Realized Volatility Cone with Spike Annotations", yaxis_title="Annualized Vol", template=DARK, height=420)
     st.plotly_chart(fig_vol, use_container_width=True)
+
+    # ── VOL REGIME COLOR BAR ──────────────────────────────────────────────────
+    if len(v21) > 40:
+        _regime_s = vol_regime(v21)
+        _regime_color_map = {"low": "#2ecc71", "normal": "#3498db", "high": "#f39c12", "extreme": "#e74c3c"}
+        _rdf = pd.DataFrame({"regime": _regime_s, "y": 1}, index=v21.index).dropna()
+        fig_rbar = go.Figure()
+        for _reg, _rc in _regime_color_map.items():
+            _mask = _rdf["regime"] == _reg
+            if _mask.any():
+                fig_rbar.add_trace(go.Bar(
+                    x=_rdf.index[_mask], y=[1]*_mask.sum(),
+                    name=_reg, marker_color=_rc, showlegend=True,
+                ))
+        fig_rbar.update_layout(
+            barmode="stack", title="Vol Regime Timeline (21d)",
+            yaxis=dict(showticklabels=False, showgrid=False),
+            height=80, template=DARK, margin=dict(t=30, b=20),
+            legend=dict(orientation="h"),
+        )
+        st.plotly_chart(fig_rbar, use_container_width=True)
+
+    # ── TOP VOL SPIKES TABLE ──────────────────────────────────────────────────
+    if len(v21) > 40 and spike_events:
+        st.subheader("Top Vol Spike Periods")
+        _spike_rows = []
+        for sp_date, sp_val, sp_p95 in spike_events[:5]:
+            _pct_above = (sp_val / sp_p95 - 1) * 100 if sp_p95 > 0 else 0
+            _spike_rows.append({
+                "Date": str(sp_date)[:10],
+                "10d Realized Vol": f"{sp_val:.1%}",
+                "95th Pct Threshold": f"{sp_p95:.1%}",
+                "% Above Threshold": f"+{_pct_above:.0f}%",
+            })
+        st.dataframe(pd.DataFrame(_spike_rows), use_container_width=True, hide_index=True)
 
     # Vol regime coloring
     regime_labels = vol_regime(vol_df["vol_21d"].dropna())
@@ -298,6 +480,33 @@ with tab2:
     fig_sk.add_hline(y=3, line_dash="dot", line_color="white", row=2, col=1)
     fig_sk.update_layout(template=DARK, height=400, title="Higher moments — flag when |skew|>1 or kurt>3")
     st.plotly_chart(fig_sk, use_container_width=True)
+
+    # ── INTERPRETIVE COMMENTARY ───────────────────────────────────────────────
+    _v21_last = vol_df["vol_21d"].dropna().iloc[-1] if not vol_df["vol_21d"].dropna().empty else np.nan
+    _v252_last = vol_df["vol_252d"].dropna().iloc[-1] if not vol_df["vol_252d"].dropna().empty else np.nan
+    _skew_last = skk_df["skewness"].dropna().iloc[-1] if not skk_df["skewness"].dropna().empty else np.nan
+    _kurt_last  = skk_df["excess_kurtosis"].dropna().iloc[-1] if not skk_df["excess_kurtosis"].dropna().empty else np.nan
+    _vol_bullets = []
+    if not np.isnan(_v21_last):
+        _regime_now = str(vol_regime(vol_df["vol_21d"].dropna()).iloc[-1]) if not vol_df["vol_21d"].dropna().empty else "unknown"
+        _vol_bullets.append(f"Current 21d realized vol is **{_v21_last:.1%}** (annualized) — vol regime is **{_regime_now}** relative to 2-year history.")
+    if not np.isnan(_v21_last) and not np.isnan(_v252_last):
+        _ratio = _v21_last / _v252_last
+        _dir = "above" if _ratio > 1 else "below"
+        _vol_bullets.append(f"Short-term vol ({_v21_last:.1%}) is **{_ratio:.1f}x** the 1-year average ({_v252_last:.1%}) — vol is currently {_dir} its long-run baseline.")
+    if not np.isnan(_skew_last):
+        _skew_interp = "right-skewed (large positive outliers more likely)" if _skew_last > 0.5 else "left-skewed (large negative outliers more likely)" if _skew_last < -0.5 else "roughly symmetric"
+        _vol_bullets.append(f"Rolling skewness ({_skew_last:.2f}) — returns are {_skew_interp}.")
+    if not np.isnan(_kurt_last) and _kurt_last > 3:
+        _vol_bullets.append(f"Excess kurtosis ({_kurt_last:.2f}) is well above 3 — extreme moves occur far more often than a normal distribution predicts. Standard deviation understates risk.")
+    if _vol_bullets:
+        _bullet_html = "".join(f"<li style='margin-bottom:4px'>{b}</li>" for b in _vol_bullets)
+        st.markdown(
+            f"<div style='background:#1a1a2e;border-left:4px solid #3498db;padding:12px 16px;border-radius:4px;margin-top:8px'>"
+            f"<b style='color:#3498db'>What this means for {_ticker}:</b>"
+            f"<ul style='margin-top:8px;color:#ddd;font-size:13px'>{_bullet_html}</ul></div>",
+            unsafe_allow_html=True,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -376,6 +585,32 @@ with tab3:
     worst.columns = ["Date", "Return"]
     worst["Return"] = worst["Return"].map("{:.2%}".format)
     st.dataframe(worst, use_container_width=True)
+
+    # ── INTERPRETIVE COMMENTARY ───────────────────────────────────────────────
+    _tail_bullets = []
+    _k_val = simple_r.kurtosis()
+    _s_val = simple_r.skew()
+    _cvar99 = hist["cvar_99"]
+    _var99  = hist["var_99"]
+    _var_cf = cf.get("var_cf_99", _var99)
+    if _k_val > 3:
+        _underest = (_var_cf / _var99 - 1) * 100 if _var99 > 0 else 0
+        _tail_bullets.append(f"Fat tails are **{'extreme' if _k_val > 5 else 'significant'}** (kurtosis {_k_val:.2f}) — standard normal VaR underestimates true tail risk by approximately **{_underest:.0f}%** (Cornish-Fisher correction).")
+    _tail_bullets.append(f"On the worst 1% of trading days, expect losses of **{_cvar99:.2%} or more** (CVaR 99%).")
+    if abs(_s_val) > 0.3:
+        _skew_msg = (f"Return distribution is **right-skewed ({_s_val:.2f})** — occasional large positive outliers offset frequent small losses."
+                     if _s_val > 0 else
+                     f"Return distribution is **left-skewed ({_s_val:.2f})** — large negative returns are more frequent than large positive ones. Downside risk is asymmetric.")
+        _tail_bullets.append(_skew_msg)
+    if _var_cf > _var99 * 1.1:
+        _tail_bullets.append(f"Cornish-Fisher VaR 99% ({_var_cf:.2%}) is materially higher than historical VaR ({_var99:.2%}) — use CF-adjusted estimates for position sizing and risk limits.")
+    _bullet_html = "".join(f"<li style='margin-bottom:4px'>{b}</li>" for b in _tail_bullets)
+    st.markdown(
+        f"<div style='background:#1a1a2e;border-left:4px solid #e74c3c;padding:12px 16px;border-radius:4px;margin-top:8px'>"
+        f"<b style='color:#e74c3c'>What this means for {_ticker}:</b>"
+        f"<ul style='margin-top:8px;color:#ddd;font-size:13px'>{_bullet_html}</ul></div>",
+        unsafe_allow_html=True,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -460,31 +695,96 @@ with tab5:
         st.warning("Macro data unavailable. Set FRED_API_KEY environment variable or ensure pandas-datareader is working.")
     else:
         macro_regimes = classify_macro_regime(macro_df)
-        current_regime = macro_regimes.iloc[-1] if len(macro_regimes) > 0 else "UNKNOWN"
+        current_regime = str(macro_regimes.iloc[-1]) if len(macro_regimes) > 0 else "UNKNOWN"
         regime_color = REGIME_COLORS.get(current_regime, "#7f8c8d")
 
-        # Traffic light
-        col_tl, col_desc = st.columns([1, 3])
-        with col_tl:
-            st.markdown(
-                f"<div style='background:{regime_color};padding:20px;border-radius:10px;"
-                f"text-align:center;font-size:24px;font-weight:bold;color:white'>"
-                f"{current_regime}</div>",
-                unsafe_allow_html=True,
-            )
-        with col_desc:
-            descriptions = {
-                "RISK_ON": "Rates falling, spreads tightening — risk assets typically favored.",
-                "RISK_OFF": "Rates rising, spreads widening — defensive positioning warranted.",
-                "STAGFLATION_PROXY": "Rates rising while credit spreads tighten — unusual stress.",
-                "MIXED": "No clear directional signal from rates or credit spreads.",
-                "UNKNOWN": "Insufficient data to classify regime.",
-            }
-            st.info(descriptions.get(current_regime, ""))
+        # ── EXACT NUMBERS DRIVING THE REGIME ─────────────────────────────────
+        _window_days = 63
+        _dgs10_now = float(macro_df["DGS10"].dropna().iloc[-1]) if "DGS10" in macro_df.columns and not macro_df["DGS10"].dropna().empty else np.nan
+        _dgs10_prev = float(macro_df["DGS10"].dropna().iloc[-_window_days]) if "DGS10" in macro_df.columns and len(macro_df["DGS10"].dropna()) > _window_days else np.nan
+        _dgs10_chg = (_dgs10_now - _dgs10_prev) * 100 if not np.isnan(_dgs10_now) and not np.isnan(_dgs10_prev) else np.nan
 
-        # Yield curve + credit spread chart with regime bands
+        _hy_now = float(macro_df["BAMLH0A0HYM2"].dropna().iloc[-1]) if "BAMLH0A0HYM2" in macro_df.columns and not macro_df["BAMLH0A0HYM2"].dropna().empty else np.nan
+        _hy_prev = float(macro_df["BAMLH0A0HYM2"].dropna().iloc[-_window_days]) if "BAMLH0A0HYM2" in macro_df.columns and len(macro_df["BAMLH0A0HYM2"].dropna()) > _window_days else np.nan
+        _hy_chg = (_hy_now - _hy_prev) * 100 if not np.isnan(_hy_now) and not np.isnan(_hy_prev) else np.nan
+
+        _yc_now = float(macro_df["T10Y2Y"].dropna().iloc[-1]) if "T10Y2Y" in macro_df.columns and not macro_df["T10Y2Y"].dropna().empty else np.nan
+
+        # Metric cards row
+        _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+        def _macro_card(col, label, value, change_bps, change_label, unit=""):
+            _dir = "RISING ▲" if (change_bps or 0) > 5 else "FALLING ▼" if (change_bps or 0) < -5 else "FLAT →"
+            _dc = "#e74c3c" if _dir.startswith("R") else "#2ecc71" if _dir.startswith("F") else "#95a5a6"
+            _val_str = f"{value:.2f}{unit}" if not np.isnan(value) else "N/A"
+            _chg_str = f"{change_bps:+.0f} bps (3m)" if change_bps is not None and not np.isnan(change_bps) else ""
+            col.markdown(
+                f"<div style='background:#1e1e2e;border-radius:6px;padding:12px;border-top:3px solid {_dc}'>"
+                f"<div style='font-size:12px;color:#aaa'>{label}</div>"
+                f"<div style='font-size:22px;font-weight:bold;color:white'>{_val_str}</div>"
+                f"<div style='font-size:11px;color:#aaa'>{_chg_str}</div>"
+                f"<div style='font-size:12px;font-weight:bold;color:{_dc}'>{_dir}</div>"
+                f"</div>", unsafe_allow_html=True)
+
+        if not np.isnan(_dgs10_now):
+            _macro_card(_mc1, "10Y Treasury Yield", _dgs10_now, _dgs10_chg, "rates", "%")
+        if not np.isnan(_hy_now):
+            _macro_card(_mc2, "HY Credit Spread", _hy_now, _hy_chg, "spreads", "%")
+        if not np.isnan(_yc_now):
+            _yc_label = "INVERTED ▼" if _yc_now < 0 else "FLAT →" if _yc_now < 0.3 else "NORMAL ▲"
+            _yc_dc = "#e74c3c" if _yc_now < 0 else "#f39c12" if _yc_now < 0.3 else "#2ecc71"
+            _mc3.markdown(
+                f"<div style='background:#1e1e2e;border-radius:6px;padding:12px;border-top:3px solid {_yc_dc}'>"
+                f"<div style='font-size:12px;color:#aaa'>Yield Curve (10Y-2Y)</div>"
+                f"<div style='font-size:22px;font-weight:bold;color:white'>{_yc_now:.2f}%</div>"
+                f"<div style='font-size:12px;font-weight:bold;color:{_yc_dc}'>{_yc_label}</div>"
+                f"</div>", unsafe_allow_html=True)
+
+        # Traffic light
+        _mc4.markdown(
+            f"<div style='background:{regime_color};border-radius:6px;padding:12px;text-align:center;height:100%'>"
+            f"<div style='font-size:12px;color:white;opacity:0.8'>Current Regime</div>"
+            f"<div style='font-size:20px;font-weight:bold;color:white;margin-top:4px'>{current_regime}</div>"
+            f"</div>", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── 2×2 REGIME MATRIX ────────────────────────────────────────────────
+        st.subheader("Macro Regime Matrix")
+        _matrix_cells = [
+            ("Rates ↑ + Spreads ↑", "RISK OFF", "#e74c3c", "Tightest credit, highest rate burden. Defensive positioning."),
+            ("Rates ↑ + Spreads ↓", "REFLATIONARY", "#e67e22", "Growth expanding, rates catching up. Cyclicals may outperform."),
+            ("Rates ↓ + Spreads ↑", "RECESSION FEAR", "#c0392b", "Flight to safety. Credit stress rising. Risk-off equities."),
+            ("Rates ↓ + Spreads ↓", "RISK ON", "#2ecc71", "Easy financial conditions. Risk assets broadly favored."),
+        ]
+        # Highlight current regime cell
+        _rate_rising = not np.isnan(_dgs10_chg) and _dgs10_chg > 5
+        _spread_widening = not np.isnan(_hy_chg) and _hy_chg > 5
+        _active_matrix = {
+            (True, True): "RISK OFF",
+            (True, False): "REFLATIONARY",
+            (False, True): "RECESSION FEAR",
+            (False, False): "RISK ON",
+        }.get((_rate_rising, _spread_widening), current_regime)
+
+        _m1, _m2 = st.columns(2)
+        for idx, (label, rname, color, desc) in enumerate(_matrix_cells):
+            _col = _m1 if idx % 2 == 0 else _m2
+            _is_active = (rname == _active_matrix)
+            _border = f"3px solid {color}" if _is_active else f"1px solid {color}44"
+            _bg = f"{color}33" if _is_active else f"{color}11"
+            _active_badge = " ← CURRENT" if _is_active else ""
+            _col.markdown(
+                f"<div style='background:{_bg};border:{_border};border-radius:8px;padding:12px;margin-bottom:8px'>"
+                f"<b style='color:{color}'>{label}</b><b style='color:{color}'>{_active_badge}</b><br>"
+                f"<span style='font-size:16px;font-weight:bold;color:white'>{rname}</span><br>"
+                f"<span style='font-size:12px;color:#ccc'>{desc}</span>"
+                f"</div>", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── CHARTS ──────────────────────────────────────────────────────────
         fig_macro = make_subplots(rows=3, cols=1, shared_xaxes=True,
-            subplot_titles=["10Y Treasury Yield", "HY Credit Spread", "Yield Curve (10Y-2Y)"])
+            subplot_titles=["10Y Treasury Yield (%)", "HY Credit Spread (%)", "Yield Curve (10Y-2Y, %)"])
 
         for series_id, row in [("DGS10", 1), ("BAMLH0A0HYM2", 2), ("T10Y2Y", 3)]:
             if series_id in macro_df.columns:
@@ -493,77 +793,64 @@ with tab5:
                     row=row, col=1,
                 )
 
-        # Compress daily regime series into contiguous blocks before adding
-        # vrects — avoids creating 700+ shapes (one per day) which freezes the chart.
+        # Yield curve zero line
+        if "T10Y2Y" in macro_df.columns:
+            fig_macro.add_hline(y=0, row=3, col=1, line_dash="dot", line_color="white", line_width=1)
+
+        # Regime bands (block-compressed)
         if len(macro_regimes) > 0:
             prev_r = str(macro_regimes.iloc[0])
             block_start = macro_regimes.index[0]
             for t, r in macro_regimes.items():
                 r = str(r)
                 if r != prev_r:
-                    fig_macro.add_vrect(
-                        x0=block_start, x1=t,
-                        fillcolor=REGIME_COLORS.get(prev_r, "gray"),
-                        opacity=0.08, line_width=0,
-                    )
+                    fig_macro.add_vrect(x0=block_start, x1=t,
+                        fillcolor=REGIME_COLORS.get(prev_r, "gray"), opacity=0.08, line_width=0)
                     block_start = t
                     prev_r = r
-            fig_macro.add_vrect(
-                x0=block_start, x1=macro_regimes.index[-1],
-                fillcolor=REGIME_COLORS.get(prev_r, "gray"),
-                opacity=0.08, line_width=0,
-            )
+            fig_macro.add_vrect(x0=block_start, x1=macro_regimes.index[-1],
+                fillcolor=REGIME_COLORS.get(prev_r, "gray"), opacity=0.08, line_width=0)
 
-        fig_macro.update_layout(template=DARK, height=600, title="Macro Indicators with Regime Bands")
+        fig_macro.update_layout(template=DARK, height=550, title="Macro Indicators with Regime Bands")
         st.plotly_chart(fig_macro, use_container_width=True)
 
-        # VIX regime
-        if "VIXCLS" in macro_df.columns:
-            vix_s = macro_df["VIXCLS"].dropna()
-            vix_regimes = vix_regime(vix_s)
-            st.subheader("VIX Regime Analysis")
-
-            # Align stock returns to VIX dates
-            vix_df_merged = pd.DataFrame({
-                "vix": vix_s,
-                "vix_regime": vix_regimes,
-            })
-            stock_r = simple_r.rename("stock_ret")
-            merged = vix_df_merged.join(stock_r, how="inner").dropna()
-
-            cond_table = conditional_returns_by_regime(
-                prices.reindex(merged.index),
-                merged["vix_regime"].astype(str),
-            )
-
-            st.dataframe(
-                cond_table.style.format({
-                    "mean_daily_ret": "{:.4f}",
-                    "ann_return": "{:.2%}",
-                    "ann_vol": "{:.2%}",
-                    "sharpe": "{:.2f}",
-                }),
-                use_container_width=True,
-            )
-
-        # Conditional returns by macro regime
-        st.subheader(f"Conditional Performance of {_ticker} by Macro Regime")
+        # ── CONDITIONAL PERFORMANCE TABLE ─────────────────────────────────
+        st.subheader(f"{_ticker} Historical Performance by Macro Regime")
         aligned_macro = macro_regimes.reindex(prices.index, method="ffill").dropna()
         cond_macro = conditional_returns_by_regime(prices.reindex(aligned_macro.index), aligned_macro)
         if not cond_macro.empty:
-            fig_cond = go.Figure()
-            colors_regime = [REGIME_COLORS.get(r, "#95a5a6") for r in cond_macro.index]
-            fig_cond.add_trace(go.Bar(
-                x=cond_macro.index.astype(str),
-                y=cond_macro["ann_return"],
-                name="Ann. Return",
-                marker_color=colors_regime,
-                text=[f"{v:.1%}" for v in cond_macro["ann_return"]],
-                textposition="outside",
-            ))
-            fig_cond.update_layout(title=f"{_ticker} Annualized Return by Macro Regime", yaxis_title="Ann. Return", yaxis_tickformat=".0%", template=DARK, height=300)
-            st.plotly_chart(fig_cond, use_container_width=True)
-            st.dataframe(cond_macro.style.format({"mean_daily_ret": "{:.4f}", "ann_return": "{:.2%}", "ann_vol": "{:.2%}", "sharpe": "{:.2f}"}), use_container_width=True)
+            st.dataframe(
+                cond_macro.style.format({
+                    "mean_daily_ret": "{:.4f}", "ann_return": "{:.2%}",
+                    "ann_vol": "{:.2%}", "sharpe": "{:.2f}",
+                }).background_gradient(subset=[c for c in ["ann_return", "sharpe"] if c in cond_macro.columns], cmap="RdYlGn"),
+                use_container_width=True,
+            )
+            # Plain-English summary for current regime
+            if current_regime in cond_macro.index:
+                _cr = cond_macro.loc[current_regime]
+                st.info(
+                    f"In the current **{current_regime}** regime, **{_ticker}** has historically returned "
+                    f"**{_cr['ann_return']:.1%}** annualized with **{_cr['ann_vol']:.1%}** vol "
+                    f"(Sharpe {_cr['sharpe']:.2f}) over **{int(_cr['n_days'])}** trading days."
+                )
+
+        # VIX regime conditional returns
+        if "VIXCLS" in macro_df.columns:
+            vix_s = macro_df["VIXCLS"].dropna()
+            vix_regimes = vix_regime(vix_s)
+            st.subheader("Conditional Performance by VIX Regime")
+            vix_df_merged = pd.DataFrame({"vix": vix_s, "vix_regime": vix_regimes})
+            merged = vix_df_merged.join(simple_r.rename("ret"), how="inner").dropna()
+            cond_vix = conditional_returns_by_regime(prices.reindex(merged.index), merged["vix_regime"].astype(str))
+            if not cond_vix.empty:
+                st.dataframe(
+                    cond_vix.style.format({
+                        "mean_daily_ret": "{:.4f}", "ann_return": "{:.2%}",
+                        "ann_vol": "{:.2%}", "sharpe": "{:.2f}",
+                    }),
+                    use_container_width=True,
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -776,25 +1063,129 @@ with tab7:
         st.error(f"⚠️ REGIME MISMATCH: {gv_r['classification']} stock in {gv_r['macro_regime']} regime. "
                  f"Regime currently favors {gv_r['regime_favors']} stocks.")
 
+    # ── ALTMAN Z-SCORE COMPONENTS ────────────────────────────────────────────
+    st.subheader("Altman Z-Score Breakdown")
+    _z = bs_r.get("z_score", np.nan)
+    if not np.isnan(_z):
+        _z_color = "#2ecc71" if _z > 2.99 else "#f39c12" if _z > 1.81 else "#e74c3c"
+        _z_label = "SAFE ZONE (Z > 2.99)" if _z > 2.99 else "GREY ZONE (1.81 < Z < 2.99)" if _z > 1.81 else "DISTRESS ZONE (Z < 1.81)"
+        st.markdown(
+            f"<div style='background:{_z_color}22;border:1px solid {_z_color};border-radius:6px;padding:14px;margin-bottom:10px'>"
+            f"<div style='font-size:13px;color:#aaa'>Z = 1.2×X1 + 1.4×X2 + 3.3×X3 + 0.6×X4 + 1.0×X5</div>"
+            f"<div style='font-size:28px;font-weight:bold;color:{_z_color}'>Z = {_z:.2f} — {_z_label}</div>"
+            f"<div style='font-size:12px;color:#ccc;margin-top:6px'>"
+            f"X1=Working Capital/Assets &nbsp;|&nbsp; X2=Retained Earnings/Assets &nbsp;|&nbsp; "
+            f"X3=EBIT/Assets &nbsp;|&nbsp; X4=Mkt Cap/Total Liabilities &nbsp;|&nbsp; X5=Revenue/Assets"
+            f"</div></div>",
+            unsafe_allow_html=True,
+        )
+        # Gauge for Z-score
+        _fig_z = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=_z,
+            title={"text": "Altman Z-Score"},
+            gauge={
+                "axis": {"range": [0, 5]},
+                "bar": {"color": _z_color},
+                "steps": [
+                    {"range": [0, 1.81], "color": "#3a0a0a"},
+                    {"range": [1.81, 2.99], "color": "#3a2e0a"},
+                    {"range": [2.99, 5], "color": "#0d2b0d"},
+                ],
+                "threshold": {"line": {"color": "white", "width": 2}, "thickness": 0.75, "value": _z},
+            },
+        ))
+        _fig_z.update_layout(height=220, template=DARK, margin=dict(t=30, b=10))
+        st.plotly_chart(_fig_z, use_container_width=True)
+    else:
+        st.info("Altman Z-Score could not be computed (insufficient balance sheet data).")
+
     # ── PEER COMPARISON TABLE ─────────────────────────────────────────────────
     st.subheader("Valuation vs Sector Peers")
+    # Build multi-ticker peer comparison (fetch live data for key peers)
+    _sector_info = info.get("sector", "")
+    # Industry-specific hardcoded peers for common sectors (as fallback / supplement)
+    _industry_peers = {
+        "Airlines": ["DAL", "UAL", "LUV", "SAVE", "JBLU"],
+        "Oil & Gas E&P": ["CVX", "COP", "EOG", "PXD", "DVN"],
+        "Semiconductors": ["NVDA", "AMD", "INTC", "QCOM", "AVGO"],
+        "Banks": ["JPM", "BAC", "WFC", "C", "GS"],
+        "Biotech": ["AMGN", "GILD", "REGN", "VRTX", "BIIB"],
+    }
+    _industry = info.get("industry", "")
+    _hardcoded_peers = next(
+        (v for k, v in _industry_peers.items() if k.lower() in _industry.lower()),
+        []
+    )
+    # Use cached peer info from val_r, supplement with hardcoded if peer_count is low
+    _peer_tickers = ([r["ticker"] for _, r in val_r.get("_peer_df_rows", {}).items()]
+                     if "_peer_df_rows" in val_r else [])
+    if len(_peer_tickers) < 3 and _hardcoded_peers:
+        _peer_tickers = [p for p in _hardcoded_peers if p != _ticker]
+
+    _peer_compare_rows = []
+    for _pt in _peer_tickers[:6]:
+        try:
+            _pi = yf.Ticker(_pt).info or {}
+            _peer_fcf_yield = np.nan
+            try:
+                _pcf = yf.Ticker(_pt).cashflow
+                if _pcf is not None and not _pcf.empty:
+                    _pocf_row = next((i for i in _pcf.index if "operating cash flow" in str(i).lower()), None)
+                    _pcap_row = next((i for i in _pcf.index if "capital expenditure" in str(i).lower()), None)
+                    if _pocf_row and _pcap_row:
+                        _pocf = float(_pcf.loc[_pocf_row].iloc[0]) if pd.notna(_pcf.loc[_pocf_row].iloc[0]) else np.nan
+                        _pcap = float(_pcf.loc[_pcap_row].iloc[0]) if pd.notna(_pcf.loc[_pcap_row].iloc[0]) else np.nan
+                        _pmcap = _pi.get("marketCap")
+                        if not any(np.isnan(x) for x in [_pocf, _pcap]) and _pmcap:
+                            _peer_fcf_yield = (_pocf - abs(_pcap)) / _pmcap
+            except Exception:
+                pass
+            _peer_compare_rows.append({
+                "Ticker": _pt,
+                "P/E": _fmt(_pi.get("trailingPE")),
+                "P/B": _fmt(_pi.get("priceToBook")),
+                "EV/EBITDA": _fmt(_pi.get("enterpriseToEbitda")),
+                "D/E": _fmt(_pi.get("debtToEquity")),
+                "FCF Yield": f"{_peer_fcf_yield:.1%}" if not np.isnan(_peer_fcf_yield) else "N/A",
+            })
+        except Exception:
+            continue
+
+    # Insert subject ticker first
+    _own_fcf_yield = cf_r.get("fcf_yield", np.nan)
+    _subject_row = {
+        "Ticker": f"★ {_ticker}",
+        "P/E": _fmt(val_r["metrics"]["trailingPE"]),
+        "P/B": _fmt(val_r["metrics"]["priceToBook"]),
+        "EV/EBITDA": _fmt(val_r["metrics"]["evToEbitda"]),
+        "D/E": _fmt(bs_r.get("debt_to_equity")),
+        "FCF Yield": f"{_own_fcf_yield:.1%}" if not np.isnan(_own_fcf_yield) else "N/A",
+    }
+    _all_peer_rows = [_subject_row] + _peer_compare_rows
+    if _all_peer_rows:
+        st.dataframe(pd.DataFrame(_all_peer_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Peer comparison data unavailable. Sector peers could not be loaded.")
+
+    # Sector percentile ranking (from val_r)
     peer_metrics = [
-        ("Trailing P/E",  "trailingPE",   val_r["metrics"]["trailingPE"],   val_r["peer_ranks"].get("trailingPE_pct")),
-        ("Forward P/E",   "forwardPE",    val_r["metrics"]["forwardPE"],    val_r["peer_ranks"].get("forwardPE_pct")),
-        ("Price/Book",    "priceToBook",  val_r["metrics"]["priceToBook"],  val_r["peer_ranks"].get("priceToBook_pct")),
-        ("Price/Sales",   "priceToSales", val_r["metrics"]["priceToSales"], val_r["peer_ranks"].get("priceToSales_pct")),
-        ("EV/EBITDA",     "evToEbitda",   val_r["metrics"]["evToEbitda"],   val_r["peer_ranks"].get("evToEbitda_pct")),
-        ("PEG Ratio",     "pegRatio",     val_r["metrics"]["pegRatio"],     None),
+        ("Trailing P/E",  val_r["metrics"]["trailingPE"],   val_r["peer_ranks"].get("trailingPE_pct")),
+        ("Forward P/E",   val_r["metrics"]["forwardPE"],    val_r["peer_ranks"].get("forwardPE_pct")),
+        ("Price/Book",    val_r["metrics"]["priceToBook"],  val_r["peer_ranks"].get("priceToBook_pct")),
+        ("Price/Sales",   val_r["metrics"]["priceToSales"], val_r["peer_ranks"].get("priceToSales_pct")),
+        ("EV/EBITDA",     val_r["metrics"]["evToEbitda"],   val_r["peer_ranks"].get("evToEbitda_pct")),
     ]
-    peer_rows = []
-    for label, _, value, rank in peer_metrics:
-        peer_rows.append({
+    prank_rows = []
+    for label, value, rank in peer_metrics:
+        prank_rows.append({
             "Metric": label,
-            "Value": _fmt(value),
+            f"{_ticker} Value": _fmt(value),
             "Sector Percentile": f"{rank:.0f}th" if rank is not None and not np.isnan(rank) else "N/A",
             "Signal": ("🔴 Expensive" if rank and rank > 75 else "🟢 Cheap" if rank and rank < 25 else "🟡 Neutral") if rank is not None and not np.isnan(rank) else "—",
         })
-    st.dataframe(pd.DataFrame(peer_rows), use_container_width=True, hide_index=True)
+    st.caption("Sector percentile rank (0th = cheapest in sector, 100th = most expensive):")
+    st.dataframe(pd.DataFrame(prank_rows), use_container_width=True, hide_index=True)
 
     # ── EARNINGS SURPRISE HISTORY ─────────────────────────────────────────────
     st.subheader("Earnings Surprise History (last 8 quarters)")
