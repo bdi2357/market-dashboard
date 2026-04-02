@@ -576,14 +576,12 @@ with tab6:
     # Stress test
     st.subheader("Stress Test Results")
     if not stress.empty:
-        st.dataframe(
-            stress.style.format({
-                "total_return": "{:.2%}",
-                "ann_vol": "{:.2%}",
-                "max_drawdown": "{:.2%}",
-                "sharpe": "{:.2f}",
-            }).background_gradient(subset=["total_return", "max_drawdown"], cmap="RdYlGn"),
-            use_container_width=True,
-        )
+        numeric_cols = {"total_return": "{:.2%}", "ann_vol": "{:.2%}", "max_drawdown": "{:.2%}", "sharpe": "{:.2f}"}
+        fmt = {k: v for k, v in numeric_cols.items() if k in stress.columns}
+        gradient_cols = [c for c in ["total_return", "max_drawdown"] if c in stress.columns]
+        styler = stress.style.format(fmt)
+        if gradient_cols:
+            styler = styler.background_gradient(subset=gradient_cols, cmap="RdYlGn")
+        st.dataframe(styler, use_container_width=True)
     else:
         st.info("No stress test data available for the selected period.")
