@@ -46,6 +46,11 @@ from risk.fundamental import (
     cashflow_risk, growth_value_classification,
     fetch_material_news, composite_fundamental_score,
 )
+from data.edgar import (
+    fetch_insider_transactions, compute_insider_signals,
+    fetch_institutional_changes, compute_institutional_signals,
+    fetch_activist_positions, fetch_xbrl_fundamentals,
+)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Risk Dashboard", layout="wide", page_icon="📊")
@@ -134,7 +139,7 @@ sector_prices = sector_df["Close"] if not sector_df.empty else prices
 simple_r = prices.pct_change().dropna()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "🎯 Risk Scorecard",
     "📈 Volatility Surface",
     "⚠️ Tail Risk",
@@ -142,6 +147,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🌍 Macro Regime",
     "🧪 Backtester",
     "📋 Fundamental Risk",
+    "🏛️ Smart Money",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1266,3 +1272,293 @@ with tab7:
                 )
     else:
         st.info("No material news found for this ticker.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 8 — SMART MONEY (SEC EDGAR)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab8:
+    st.subheader(f"Smart Money — SEC EDGAR Data for {_ticker}")
+    st.caption("Form 4 insider transactions · 13F institutional holdings · 13D/13G activist detection · XBRL fundamentals")
+
+    _sm_key = f"smart_money_{_ticker}"
+    if _sm_key not in st.session_state:
+        _sm_progress = st.progress(0, text="Resolving CIK from EDGAR...")
+        try:
+            from data.edgar import resolve_cik as _rcik
+            _cik_val = _rcik(_ticker)
+            _sm_progress.progress(15, text="Fetching Form 4 insider transactions...")
+            _insider_df = fetch_insider_transactions(_ticker, days_back=180)
+            _sm_progress.progress(40, text="Computing insider signals...")
+            _insider_signals = compute_insider_signals(_insider_df)
+            _sm_progress.progress(55, text="Fetching 13F institutional holdings...")
+            _inst_df = fetch_institutional_changes(_ticker)
+            _sm_progress.progress(75, text="Computing institutional signals...")
+            _inst_signals = compute_institutional_signals(_inst_df)
+            _sm_progress.progress(85, text="Checking 13D/13G activist filings...")
+            _activist_df = fetch_activist_positions(_ticker)
+            _sm_progress.progress(95, text="Fetching XBRL fundamentals...")
+            _xbrl = fetch_xbrl_fundamentals(_ticker)
+            _sm_progress.progress(100, text="Done.")
+            _sm_progress.empty()
+            st.session_state[_sm_key] = (_cik_val, _insider_df, _insider_signals,
+                                          _inst_df, _inst_signals, _activist_df, _xbrl)
+        except Exception as _e:
+            _sm_progress.empty()
+            st.error(f"EDGAR data load failed: {_e}")
+            st.stop()
+
+    (_cik_val, _insider_df, _insider_signals,
+     _inst_df, _inst_signals, _activist_df, _xbrl) = st.session_state[_sm_key]
+
+    if not _cik_val:
+        st.error(f"Could not resolve CIK for {_ticker}. EDGAR data unavailable.")
+        st.stop()
+
+    st.caption(f"CIK: {_cik_val}  |  Data source: SEC EDGAR (free API)")
+
+    # ── SECTION 1: INSIDER ACTIVITY ──────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📊 Section 1: Insider Activity (Form 4)")
+
+    # Cluster alert banner
+    _cluster = _insider_signals.get("cluster_signal")
+    _cluster_names = _insider_signals.get("cluster_insiders", [])
+    if _cluster == "BUY":
+        st.markdown(
+            f"<div style='background:#2ecc7122;border-left:5px solid #2ecc71;padding:12px 18px;border-radius:6px;margin-bottom:12px'>"
+            f"<b style='color:#2ecc71;font-size:16px'>🟢 INSIDER BUYING CLUSTER</b><br>"
+            f"<span style='color:#ccc'>{len(_cluster_names)} insiders bought in the last 30 days: {', '.join(_cluster_names[:5])}</span>"
+            f"</div>", unsafe_allow_html=True)
+    elif _cluster == "SELL":
+        st.markdown(
+            f"<div style='background:#e74c3c22;border-left:5px solid #e74c3c;padding:12px 18px;border-radius:6px;margin-bottom:12px'>"
+            f"<b style='color:#e74c3c;font-size:16px'>🔴 INSIDER SELLING CLUSTER</b><br>"
+            f"<span style='color:#ccc'>{len(_cluster_names)} insiders sold in the last 30 days: {', '.join(_cluster_names[:5])}</span>"
+            f"</div>", unsafe_allow_html=True)
+    else:
+        st.info("🟡 No insider cluster signal detected in the last 30 days.")
+
+    # Summary metrics
+    _si = _insider_signals
+    _ic1, _ic2, _ic3, _ic4 = st.columns(4)
+    def _fmt_dollars(v):
+        if v == 0 or np.isnan(v): return "$0"
+        sign = "+" if v > 0 else ""
+        if abs(v) >= 1e6: return f"{sign}${abs(v)/1e6:.1f}M"
+        if abs(v) >= 1e3: return f"{sign}${abs(v)/1e3:.0f}K"
+        return f"{sign}${abs(v):.0f}"
+    _ic1.metric("Net Insider Flow (30d)", _fmt_dollars(_si["net_30d"]),
+                help="Positive = net buying, negative = net selling (open market only)")
+    _ic2.metric("Net Insider Flow (90d)", _fmt_dollars(_si["net_90d"]))
+    _bsr = _si.get("buy_sell_ratio_90d", np.nan)
+    _ic3.metric("Buy/Sell Ratio (90d)", f"{_bsr:.2f}" if not np.isnan(_bsr) else "N/A",
+                help=">0.6 = bullish signal; <0.4 = bearish")
+    _ic4.metric("Weighted Net (CEO/CFO 2×)", _fmt_dollars(_si["weighted_net_90d"]))
+
+    if not _insider_df.empty:
+        # Price chart with insider transactions overlaid
+        _fig_ins = go.Figure()
+        _fig_ins.add_trace(go.Scatter(
+            x=prices.index, y=prices,
+            name="Price", line=dict(color="#3498db", width=1.5),
+        ))
+
+        _ins_plot = _insider_df.copy()
+        _ins_plot["date"] = pd.to_datetime(_ins_plot["date"], errors="coerce")
+        _ins_plot = _ins_plot.dropna(subset=["date"])
+        _ins_plot = _ins_plot[(_ins_plot["date"] >= prices.index[0]) & (_ins_plot["date"] <= prices.index[-1])]
+
+        if not _ins_plot.empty:
+            # Map transaction dates to nearest price dates
+            _ins_plot["price_at_date"] = _ins_plot["date"].apply(
+                lambda d: float(prices.reindex([d], method="nearest").iloc[0]) if len(prices) > 0 else np.nan
+            )
+
+            _buys_plt = _ins_plot[_ins_plot["is_buy"]]
+            _sells_plt = _ins_plot[~_ins_plot["is_buy"]]
+
+            max_dv = _ins_plot["dollar_value"].max() if not _ins_plot.empty else 1
+            _size_scale = lambda dv: max(8, min(30, int(dv / max_dv * 25) + 8))
+
+            if not _buys_plt.empty:
+                _fig_ins.add_trace(go.Scatter(
+                    x=_buys_plt["date"],
+                    y=_buys_plt["price_at_date"],
+                    mode="markers",
+                    marker=dict(
+                        symbol="triangle-up",
+                        color="#2ecc71",
+                        size=[_size_scale(v) for v in _buys_plt["dollar_value"]],
+                        line=dict(color="white", width=1),
+                    ),
+                    name="Insider Buy",
+                    text=[f"{r['name']} ({r['title']})<br>${r['dollar_value']:,.0f} ({r['shares']:,.0f} sh @ ${r['price']:.2f})"
+                          for _, r in _buys_plt.iterrows()],
+                    hovertemplate="%{text}<extra></extra>",
+                ))
+            if not _sells_plt.empty:
+                _fig_ins.add_trace(go.Scatter(
+                    x=_sells_plt["date"],
+                    y=_sells_plt["price_at_date"],
+                    mode="markers",
+                    marker=dict(
+                        symbol="triangle-down",
+                        color="#e74c3c",
+                        size=[_size_scale(v) for v in _sells_plt["dollar_value"]],
+                        line=dict(color="white", width=1),
+                    ),
+                    name="Insider Sale",
+                    text=[f"{r['name']} ({r['title']})<br>${r['dollar_value']:,.0f} ({r['shares']:,.0f} sh @ ${r['price']:.2f})"
+                          for _, r in _sells_plt.iterrows()],
+                    hovertemplate="%{text}<extra></extra>",
+                ))
+
+        _fig_ins.update_layout(
+            title=f"{_ticker} Price with Insider Transactions (▲ Buy / ▼ Sell, size = $ value)",
+            yaxis_title="Price ($)", template=DARK, height=400,
+            xaxis_rangeslider_visible=False,
+        )
+        st.plotly_chart(_fig_ins, use_container_width=True)
+
+        # Transactions table
+        st.subheader("Recent Insider Transactions (last 180 days)")
+        _show_df = _insider_df.head(30).copy()
+        _show_df["dollar_value"] = _show_df["dollar_value"].apply(lambda v: f"${v:,.0f}" if pd.notna(v) else "N/A")
+        _show_df["conviction_pct"] = _show_df["conviction_pct"].apply(lambda v: f"{v:.1f}%" if pd.notna(v) and not np.isnan(v) else "N/A")
+        _show_df["type_label"] = _show_df["is_buy"].map({True: "🟢 BUY", False: "🔴 SELL"})
+        _display_cols = ["date", "name", "title", "type_label", "shares", "price", "dollar_value", "conviction_pct"]
+        _avail_cols = [c for c in _display_cols if c in _show_df.columns]
+        st.dataframe(_show_df[_avail_cols].rename(columns={
+            "type_label": "Type", "conviction_pct": "Conviction",
+            "dollar_value": "$ Value",
+        }), use_container_width=True, hide_index=True)
+    else:
+        st.info(f"No open-market insider transactions found for {_ticker} in the last 180 days via EDGAR.")
+
+    # ── SECTION 2: INSTITUTIONAL / HEDGE FUND HOLDINGS ───────────────────────
+    st.markdown("---")
+    st.subheader("🏦 Section 2: Institutional Holdings (13F)")
+
+    _inst_sig = _inst_signals
+    _is1, _is2, _is3, _is4 = st.columns(4)
+    _is1.metric("Funds Adding", _inst_sig["n_adding"], help="# funds that increased position this quarter")
+    _is2.metric("Funds Reducing", _inst_sig["n_reducing"])
+    _is3.metric("New Positions", _inst_sig["n_new"], help="Funds that initiated a new position (most bullish)")
+    _is4.metric("Closed Positions", _inst_sig["n_closed"], help="Funds that fully exited (most bearish)")
+
+    _inst_color = "#2ecc71" if _inst_sig["signal"] == "ACCUMULATION" else "#e74c3c" if _inst_sig["signal"] == "DISTRIBUTION" else "#95a5a6"
+    st.markdown(
+        f"<div style='background:{_inst_color}22;border-left:4px solid {_inst_color};padding:10px 16px;border-radius:4px;margin:8px 0'>"
+        f"<b style='color:{_inst_color}'>Institutional Signal: {_inst_sig['signal']}</b>"
+        f"</div>", unsafe_allow_html=True)
+
+    if not _inst_df.empty:
+        # Color-coded change table
+        _inst_display = _inst_df.copy()
+        _inst_display["change_pct_fmt"] = _inst_display["change_pct"].apply(
+            lambda v: f"{v:+.1f}%" if pd.notna(v) else "NEW" if True else "N/A"
+        )
+        for _, row in _inst_df.iterrows():
+            if row["signal"] == "NEW":
+                _inst_display.loc[_, "change_pct_fmt"] = "NEW ★"
+            elif row["signal"] == "CLOSED":
+                _inst_display.loc[_, "change_pct_fmt"] = "CLOSED ✗"
+
+        _inst_display["curr_value_fmt"] = _inst_display["curr_value"].apply(
+            lambda v: f"${v/1e6:.1f}M" if pd.notna(v) and v > 0 else "—"
+        )
+        _inst_display["change_shares_fmt"] = _inst_display["change_shares"].apply(
+            lambda v: f"{v:+,.0f}" if pd.notna(v) else "N/A"
+        )
+        st.dataframe(
+            _inst_display[["fund_name", "filing_date", "curr_shares", "change_shares_fmt",
+                           "change_pct_fmt", "curr_value_fmt", "signal"]].rename(columns={
+                "fund_name": "Fund", "filing_date": "Filed",
+                "curr_shares": "Current Shares", "change_shares_fmt": "Change",
+                "change_pct_fmt": "Change %", "curr_value_fmt": "Market Value",
+                "signal": "Signal",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.info("Limited institutional 13F data available for this ticker. Large funds may not hold this position.")
+
+    # ── SECTION 3: ACTIVIST WATCH ─────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🎯 Section 3: Activist Watch (13D/13G)")
+
+    if not _activist_df.empty:
+        latest_activist = _activist_df.iloc[0]
+        _a_color = "#e74c3c" if latest_activist["activist_intent"] else "#f39c12"
+        _a_type = "ACTIVIST (13D — control/influence intent)" if latest_activist["activist_intent"] else "PASSIVE (13G — investment only)"
+        st.markdown(
+            f"<div style='background:{_a_color}33;border:2px solid {_a_color};border-radius:8px;padding:16px;margin-bottom:12px'>"
+            f"<div style='font-size:18px;font-weight:bold;color:{_a_color}'>⚡ ACTIVIST POSITION DETECTED</div>"
+            f"<div style='margin-top:8px;color:#ddd'>"
+            f"<b>{latest_activist['filer_name']}</b> — {_a_type}<br>"
+            f"Ownership: <b>{'%.1f%%' % latest_activist['ownership_pct'] if pd.notna(latest_activist['ownership_pct']) else 'See filing'}</b> | "
+            f"Filed: {latest_activist['filing_date']}"
+            f"</div></div>",
+            unsafe_allow_html=True,
+        )
+        st.dataframe(
+            _activist_df[["filer_name", "form_type", "filing_date", "ownership_pct", "amendment", "activist_intent"]].rename(columns={
+                "filer_name": "Filer", "form_type": "Form", "filing_date": "Filed",
+                "ownership_pct": "% Owned", "amendment": "Amendment", "activist_intent": "Activist (13D)",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.success(f"No activist positions detected for {_ticker} (threshold: >5% ownership via 13D/13G filing).")
+
+    # ── SECTION 4: XBRL FUNDAMENTALS VS YFINANCE ─────────────────────────────
+    st.markdown("---")
+    st.subheader("📑 Section 4: EDGAR XBRL Fundamentals")
+
+    if _xbrl.get("source") == "unavailable":
+        st.warning(f"XBRL data unavailable for {_ticker}.")
+    else:
+        _xc1, _xc2, _xc3 = st.columns(3)
+        def _b(v, label, col):
+            formatted = f"${v/1e9:.2f}B" if not np.isnan(v) and abs(v) >= 1e9 else f"${v/1e6:.0f}M" if not np.isnan(v) else "N/A"
+            col.metric(label, formatted, help="Source: EDGAR XBRL 10-K")
+
+        _b(_xbrl.get("latest_revenue", np.nan), "Revenue (XBRL)", _xc1)
+        _b(_xbrl.get("latest_net_income", np.nan), "Net Income (XBRL)", _xc2)
+        _b(_xbrl.get("latest_fcf", np.nan), "FCF (XBRL)", _xc3)
+
+        _xc4, _xc5, _xc6 = st.columns(3)
+        _b(_xbrl.get("latest_total_assets", np.nan), "Total Assets", _xc4)
+        _b(_xbrl.get("net_debt", np.nan), "Net Debt", _xc5)
+        _ic = _xbrl.get("interest_coverage", np.nan)
+        _xc6.metric("Interest Coverage", f"{_ic:.1f}×" if not np.isnan(_ic) else "N/A")
+
+        # FCF time series from XBRL
+        _fcf_s = _xbrl.get("fcf_series", pd.Series(dtype=float))
+        if not _fcf_s.empty:
+            st.subheader("FCF Trend (from EDGAR XBRL 10-K filings)")
+            _fig_xfcf = go.Figure(go.Bar(
+                x=[str(d)[:4] for d in _fcf_s.index],
+                y=(_fcf_s / 1e9).round(3),
+                marker_color=["#2ecc71" if v >= 0 else "#e74c3c" for v in _fcf_s],
+                name="FCF ($B)",
+                text=[f"${v/1e9:.2f}B" for v in _fcf_s],
+                textposition="outside",
+            ))
+            _fig_xfcf.update_layout(
+                title=f"{_ticker} Free Cash Flow (EDGAR XBRL)",
+                yaxis_title="FCF ($B)", template=DARK, height=300,
+            )
+            st.plotly_chart(_fig_xfcf, use_container_width=True)
+
+        # Accruals ratio
+        _acc = _xbrl.get("accruals_ratio", np.nan)
+        if not np.isnan(_acc):
+            _acc_c = "#e74c3c" if abs(_acc) > 0.05 else "#2ecc71"
+            st.markdown(
+                f"<div style='background:{_acc_c}22;border-left:3px solid {_acc_c};padding:8px 14px;border-radius:4px'>"
+                f"<b style='color:{_acc_c}'>Accruals Ratio (EDGAR): {_acc:.2%}</b> — "
+                f"{'⚠️ High accruals (>5%): earnings quality concern' if abs(_acc) > 0.05 else '✓ Normal earnings quality'}"
+                f"</div>", unsafe_allow_html=True)
+
+        st.caption("Source: EDGAR XBRL (10-K filings). All values in USD.")
