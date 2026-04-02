@@ -7,6 +7,7 @@ Multi-tab professional risk engine for research & backtesting.
 import warnings
 warnings.filterwarnings("ignore")
 
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -14,6 +15,15 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 from datetime import date, timedelta
+
+# Inject FRED API key from Streamlit secrets into the environment so
+# data/fetcher.py (which reads os.environ) can find it without requiring
+# the user to set the env var manually before launching Streamlit.
+if "FRED_API_KEY" not in os.environ:
+    try:
+        os.environ["FRED_API_KEY"] = st.secrets["FRED_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        pass
 
 from data.fetcher import (
     fetch_ohlcv, fetch_ticker_info, get_sector_etf,
