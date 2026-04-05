@@ -58,6 +58,7 @@ from ai.analyst import (
     generate_research_report, chat_with_analyst,
     evaluate_scenario, get_scenarios_for_sector, get_quick_synopsis,
 )
+from data.driver_discovery import discover_risk_drivers
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Risk Dashboard", layout="wide", page_icon="📊")
@@ -81,9 +82,20 @@ with st.sidebar:
     with col_b:
         end_date = st.date_input("End", value=date.today())
     benchmark = st.selectbox("Benchmark", ["SPY", "QQQ", "IWM", "DIA"], index=0)
-    fast_ma = st.number_input("Fast MA (backtest)", min_value=5, max_value=100, value=20)
-    slow_ma = st.number_input("Slow MA (backtest)", min_value=10, max_value=300, value=50)
-    sizing_method = st.selectbox("Position Sizing", ["vol_target", "kelly", "fixed"])
+    st.divider()
+    horizon = st.radio(
+        "Risk Horizon",
+        ["1 Week", "1 Month", "3 Months", "1 Year"],
+        index=1,
+        horizontal=False,
+        help="Drives AI report focus: near-term catalysts vs long-term thesis",
+    )
+    if st.session_state.get("horizon") != horizon:
+        # Clear AI report when horizon changes
+        for _k in list(st.session_state.keys()):
+            if _k.startswith("ai_report_") or _k.startswith("ai_ctx_") or _k.startswith("synopsis_"):
+                del st.session_state[_k]
+        st.session_state["horizon"] = horizon
     load = st.button("Load Data", type="primary")
 
 st.title("📊 Market Risk Dashboard")
@@ -116,12 +128,36 @@ if load:
     st.session_state.data_loaded = True
     st.session_state.ticker = ticker
     st.session_state.benchmark = benchmark
+    st.session_state["horizon"] = horizon
     # Clear stale cached computations when new data is loaded
     for _k in list(st.session_state.keys()):
         if any(_k.startswith(p) for p in ("bt_", "fund_", "smart_money_",
                                            "ai_report_", "ai_ctx_", "synopsis_",
-                                           "factor_", "shock_")):
+                                           "factor_", "shock_", "driver_")):
             del st.session_state[_k]
+
+    # ── Driver discovery (3-layer, 24h JSON cache) ────────────────────────────
+    with st.spinner("Discovering risk drivers (EDGAR + AI, cached 24h)..."):
+        try:
+            from data.edgar import resolve_cik as _rcik_load
+            _cik_load = _rcik_load(ticker)
+        except Exception:
+            _cik_load = None
+        try:
+            from ai.analyst import _get_openai as _goa, _get_tavily as _gtv
+            _dp = discover_risk_drivers(
+                ticker,
+                info.get("name", ticker),
+                info.get("sector", "Unknown"),
+                info.get("industry", "Unknown"),
+                _cik_load,
+                _gtv(),
+                _goa(),
+                horizon,
+            )
+            st.session_state[f"driver_{ticker}"] = _dp
+        except Exception:
+            st.session_state[f"driver_{ticker}"] = None
 
 if not st.session_state.data_loaded:
     st.info("Configure settings in the sidebar and click **Load Data** to begin.")
@@ -147,17 +183,24 @@ sector_prices = sector_df["Close"] if not sector_df.empty else prices
 
 simple_r = prices.pct_change().dropna()
 
+# Retrieve horizon from session state (set in sidebar)
+_horizon = st.session_state.get("horizon", "1 Month")
+
+# Fast MA / Slow MA stored separately so Backtester tab can expose them
+if "fast_ma" not in st.session_state:
+    st.session_state["fast_ma"] = 20
+if "slow_ma" not in st.session_state:
+    st.session_state["slow_ma"] = 50
+if "sizing_method" not in st.session_state:
+    st.session_state["sizing_method"] = "vol_target"
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
-    "🎯 Risk Scorecard",
-    "📈 Volatility Surface",
-    "⚠️ Tail Risk",
-    "🔗 Relative Risk",
-    "🌍 Macro Regime",
-    "🧪 Backtester",
-    "📋 Fundamental Risk",
-    "🏛️ Smart Money",
-    "📊 Factor & Shock",
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🎯 Risk Summary",
+    "📊 Market Risk",
+    "🌍 Macro & Regime",
+    "🏛️ Smart Money & Factors",
+    "📋 Fundamentals",
     "🤖 AI Analyst",
 ])
 
@@ -358,6 +401,27 @@ with tab1:
     if st.session_state.get(_syn_key):
         st.info(f"🤖 {st.session_state[_syn_key]}")
 
+    # ── DRIVER PROFILE CARD ───────────────────────────────────────────────────
+    _dp_card = st.session_state.get(f"driver_{_ticker}")
+    if _dp_card and _dp_card.get("factors"):
+        _p_icons = {"PRIMARY": "🔴", "SECONDARY": "🟡", "MONITORING": "⚪"}
+        _vel_icon = lambda v: "🔥" if v > 1.0 else "📈" if v > 0.5 else "➖"
+        st.markdown("**📡 Top Risk Drivers**")
+        _dc_rows = []
+        for _df in _dp_card["factors"][:5]:
+            _vel = _df.get("news_velocity", 0)
+            _r1m = _df.get("factor_1m_return")
+            _dc_rows.append({
+                "": f"{_p_icons.get(_df.get('priority',''), '⚪')}",
+                "Driver": _df.get("name", ""),
+                "Factor": _df.get("external_factor") or "—",
+                "1M Move": f"{_r1m:+.1f}%" if _r1m is not None else "—",
+                "News": _vel_icon(_vel),
+            })
+        st.dataframe(pd.DataFrame(_dc_rows), use_container_width=True, hide_index=True)
+        _dq = _dp_card.get("data_quality", "")
+        st.caption(f"Source: {_dq} · {str(_dp_card.get('timestamp',''))[:10]}")
+
     mdd_data = max_drawdown(prices)
     var_data = historical_var_cvar(simple_r)
     m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -380,9 +444,14 @@ with tab1:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — VOLATILITY SURFACE
+# TAB 2 — MARKET RISK (Volatility · Tail Risk · Relative Risk · Backtester)
 # ══════════════════════════════════════════════════════════════════════════════
 with tab2:
+    _mkt_s1, _mkt_s2, _mkt_s3, _mkt_s4 = st.tabs([
+        "📈 Volatility Surface", "⚠️ Tail Risk", "🔗 Relative Risk", "🧪 Backtester",
+    ])
+
+with _mkt_s1:
     st.subheader("Volatility Cone & Regime")
 
     vol_df = rolling_realized_vol(prices, windows=[10, 21, 63, 252])
@@ -545,9 +614,9 @@ with tab2:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — TAIL RISK
+# MARKET RISK — TAIL RISK
 # ══════════════════════════════════════════════════════════════════════════════
-with tab3:
+with _mkt_s2:
     st.subheader("Tail Risk Analysis")
 
     r = simple_r
@@ -649,9 +718,9 @@ with tab3:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — RELATIVE RISK
+# MARKET RISK — RELATIVE RISK
 # ══════════════════════════════════════════════════════════════════════════════
-with tab4:
+with _mkt_s3:
     st.subheader("Relative Risk Analysis")
 
     beta_spy = rolling_beta(prices, bench_prices)
@@ -721,9 +790,9 @@ with tab4:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — MACRO REGIME
+# TAB 3 — MACRO & REGIME
 # ══════════════════════════════════════════════════════════════════════════════
-with tab5:
+with tab3:
     st.subheader("Macro Regime Analysis")
 
     if macro_df.empty:
@@ -889,9 +958,24 @@ with tab5:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — BACKTESTER
+# MARKET RISK — BACKTESTER
 # ══════════════════════════════════════════════════════════════════════════════
-with tab6:
+with _mkt_s4:
+    _bt_cols = st.columns(3)
+    st.session_state["fast_ma"] = _bt_cols[0].number_input(
+        "Fast MA", min_value=5, max_value=100,
+        value=st.session_state["fast_ma"], step=5)
+    st.session_state["slow_ma"] = _bt_cols[1].number_input(
+        "Slow MA", min_value=10, max_value=300,
+        value=st.session_state["slow_ma"], step=10)
+    _sz_opts = ["vol_target", "kelly", "fixed"]
+    st.session_state["sizing_method"] = _bt_cols[2].selectbox(
+        "Position Sizing", _sz_opts,
+        index=_sz_opts.index(st.session_state["sizing_method"]))
+    fast_ma = st.session_state["fast_ma"]
+    slow_ma = st.session_state["slow_ma"]
+    sizing_method = st.session_state["sizing_method"]
+
     st.subheader(f"MA Crossover Backtest — {_ticker}")
     st.caption(f"Strategy: Long when {fast_ma}d MA > {slow_ma}d MA | Sizing: {sizing_method}")
 
@@ -963,9 +1047,9 @@ with tab6:
         st.info("No stress test data available for the selected period.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 7 — FUNDAMENTAL RISK
+# TAB 5 — FUNDAMENTALS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab7:
+with tab5:
     st.subheader(f"Fundamental Risk Analysis — {_ticker}")
 
     _fund_key = f"fund_{_ticker}"
@@ -1303,9 +1387,12 @@ with tab7:
         st.info("No material news found for this ticker.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 8 — SMART MONEY (SEC EDGAR)
+# TAB 4 — SMART MONEY & FACTORS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab8:
+with tab4:
+    _sm_s1, _sm_s2 = st.tabs(["🏛️ Smart Money", "📊 Factor & Shock"])
+
+with _sm_s1:
     st.subheader(f"Smart Money — SEC EDGAR Data for {_ticker}")
     st.caption("Form 4 insider transactions · 13F institutional holdings · 13D/13G activist detection · XBRL fundamentals")
 
@@ -1594,9 +1681,9 @@ with tab8:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 9 — FACTOR & SHOCK ANALYSIS
+# SMART MONEY & FACTORS — FACTOR & SHOCK ANALYSIS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab9:
+with _sm_s2:
     st.subheader(f"Factor & Shock Analysis — {_ticker}")
 
     _factor_key = f"factor_{_ticker}"
@@ -1832,9 +1919,9 @@ with tab9:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 10 — AI RESEARCH ANALYST
+# TAB 6 — AI ANALYST
 # ══════════════════════════════════════════════════════════════════════════════
-with tab10:
+with tab6:
     st.subheader(f"🤖 AI Research Analyst — {_ticker}")
 
     _ai_key = f"ai_report_{_ticker}"
@@ -1862,6 +1949,7 @@ with tab10:
         _inst_sig_ai = _smart_sm[4] if _smart_sm else None
         _activist_ai = _smart_sm[5] if _smart_sm else None
         _factor_ai = st.session_state.get(_factor_key)
+        _dp_ai = st.session_state.get(f"driver_{_ticker}")
 
         _status = st.empty()
         _status.write("🤖 AI analyst reading metrics...")
@@ -1873,14 +1961,19 @@ with tab10:
                 inst_signals=_inst_sig_ai,
                 activist_df=_activist_ai,
                 factor_results=_factor_ai if _factor_ai and _factor_ai.get("available") else None,
+                driver_profile=_dp_ai,
+                horizon=_horizon,
             )
             st.session_state[_ctx_key] = _ai_ctx
 
             _status.write("🔍 Searching recent news and analyst reports...")
-            _web_res = fetch_web_research(_ticker, info.get("name", _ticker), info.get("sector", ""))
+            _web_res = fetch_web_research(
+                _ticker, info.get("name", _ticker), info.get("sector", ""),
+                driver_profile=_dp_ai, horizon=_horizon,
+            )
 
             _status.write("✍️ Writing research report...")
-            _report = generate_research_report(_ai_ctx, _web_res)
+            _report = generate_research_report(_ai_ctx, _web_res, driver_profile=_dp_ai)
             st.session_state[_ai_key] = (_report, _web_res, len(_web_res))
             _status.empty()
         except Exception as _ae:
@@ -1890,6 +1983,7 @@ with tab10:
 
     _report_text, _web_res_cached, _n_web = st.session_state[_ai_key]
     _ai_ctx = st.session_state.get(_ctx_key, {})
+    _driver_profile_ai = st.session_state.get(f"driver_{_ticker}")
 
     # ── Display report as expandable sections ─────────────────────────────────
     import re as _re
@@ -1988,6 +2082,7 @@ with tab10:
                     _answer = chat_with_analyst(
                         _question, _ai_ctx,
                         st.session_state[_chat_key][:-1],
+                        driver_profile=_driver_profile_ai,
                     )
                 except Exception as _ce:
                     _answer = f"_Chat error: {_ce}_"

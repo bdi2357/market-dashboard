@@ -75,6 +75,8 @@ def build_ticker_context(
     inst_signals: dict | None = None,
     activist_df: pd.DataFrame | None = None,
     factor_results: dict | None = None,
+    driver_profile: dict | None = None,
+    horizon: str = "1 Month",
 ) -> dict:
     """
     Collect all computed metrics into a single context dict for the LLM.
@@ -196,12 +198,24 @@ def build_ticker_context(
                     continue  # skip time-series objects
                 factor_ctx[k] = val
 
+    # ── Driver profile (optional) ─────────────────────────────────────────────
+    driver_ctx: dict = {}
+    if driver_profile:
+        primary = driver_profile.get("primary_drivers", [])
+        driver_ctx["top_driver_name"] = primary[0]["name"] if primary else None
+        driver_ctx["top_driver_factor"] = primary[0].get("external_factor") if primary else None
+        driver_ctx["top_driver_score"] = primary[0].get("current_relevance_score") if primary else None
+        driver_ctx["top_driver_moving"] = primary[0].get("factor_is_moving", False) if primary else False
+        driver_ctx["top_driver_1m_return"] = primary[0].get("factor_1m_return") if primary else None
+        driver_ctx["data_quality"] = driver_profile.get("data_quality")
+
     return {
         "ticker": ticker,
         "company": info.get("name", ticker),
         "sector": info.get("sector", "Unknown"),
         "industry": info.get("industry", "Unknown"),
         "market_cap": info.get("market_cap"),
+        "horizon": horizon,
         # Market risk
         "composite_risk_score": score_data["total"],
         "ann_volatility": round(ann_vol, 4),
@@ -231,6 +245,8 @@ def build_ticker_context(
         **smart_ctx,
         # Factor model
         **factor_ctx,
+        # Driver profile
+        **driver_ctx,
     }
 
 
@@ -260,28 +276,44 @@ _NEWS_DOMAINS = [
 ]
 
 
-def fetch_web_research(ticker: str, company: str, sector: str) -> list[dict]:
+def fetch_web_research(
+    ticker: str,
+    company: str,
+    sector: str,
+    driver_profile: dict | None = None,
+    horizon: str = "1 Month",
+) -> list[dict]:
     """
-    Run 5 targeted Tavily searches and return top-10 results by relevance.
-    Returns empty list if Tavily key missing or any error occurs.
+    Run up to 7 targeted Tavily searches, prioritising primary risk drivers.
+    Returns top-10 results by relevance. Empty list on any error.
     """
     client = _get_tavily()
     if not client:
         logger.warning("Tavily key missing — skipping web research")
         return []
 
-    queries = [
-        f"{company} {ticker} earnings guidance analyst 2026",
-        f"{sector} industry risk macro outlook 2026",
-        f"{ticker} SEC insider filing Form 4 recent",
-        f"{company} credit rating debt refinancing",
-        f"{sector} institutional flows hedge fund positioning",
-    ]
+    queries: list[str] = []
 
-    seen_urls: set = set()
+    # Driver-specific queries (highest priority)
+    if driver_profile:
+        for d in driver_profile.get("primary_drivers", [])[:3]:
+            ext = d.get("external_factor", "")
+            if ext:
+                queries.append(f"{ext} outlook {company} impact")
+
+    # Horizon-specific near-term catalysts
+    if horizon in ("1 Week", "1 Month"):
+        queries.append(f"{ticker} {company} news catalyst this week")
+        queries.append(f"{sector} risk near term 2026")
+
+    # Always include earnings + credit
+    queries.append(f"{ticker} earnings guidance analyst 2026")
+    queries.append(f"{company} credit debt refinancing")
+
+    seen_urls: set[str] = set()
     results: list[dict] = []
 
-    for query in queries:
+    for query in queries[:7]:
         try:
             resp = client.search(
                 query=query,
@@ -300,7 +332,7 @@ def fetch_web_research(ticker: str, company: str, sector: str) -> list[dict]:
                         "score": float(r.get("score", 0)),
                     })
         except Exception as e:
-            logger.warning(f"Tavily query failed ({query[:40]}…): {e}")
+            logger.warning(f"Tavily query failed ({query[:50]}…): {e}")
 
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:10]
@@ -308,21 +340,33 @@ def fetch_web_research(ticker: str, company: str, sector: str) -> list[dict]:
 
 # ── PART 3: GENERATE RESEARCH REPORT ─────────────────────────────────────────
 
-_ANALYST_SYSTEM = """You are a senior equity risk analyst at a quantitative hedge fund with 20 years of experience. You specialize in:
-- Multi-factor risk decomposition
-- Behavioral finance and market regime analysis
-- Fundamental credit and equity analysis
-- Insider and institutional flow interpretation
-
-Your analysis style:
-- ALWAYS cite actual numbers from the data provided
-- NEVER make generic statements
-  BAD: "volatility is elevated"
-  GOOD: "21d realized vol of 47% sits at 89th percentile of its own 2-year history"
-- Every claim must be specific to THIS stock's actual values
-- Flag data quality issues honestly
-- Your audience: experienced traders and researchers
-- Distinguish clearly: DATA SHOWS vs YOUR INTERPRETATION"""
+def _make_analyst_system(horizon: str, top_driver_name: str | None, top_driver_factor: str | None, top_driver_score: float | None, top_driver_moving: bool) -> str:
+    moving_str = "YES — actively moving" if top_driver_moving else "stable"
+    driver_note = ""
+    if top_driver_name:
+        driver_note = f"""
+PRIMARY DRIVER IN EFFECT: {top_driver_name}
+External factor: {top_driver_factor}
+Relevance score: {top_driver_score:.2f if top_driver_score else 'N/A'} — {"⚠️ ACTIVE" if top_driver_moving else "stable"}
+"""
+    return f"""You are a senior equity risk analyst at a quantitative hedge fund.
+Your edge: surfacing NON-OBVIOUS risks that standard providers (Yahoo Finance, WSJ) miss.
+{driver_note}
+ABSOLUTE RULES:
+1. Address PRIMARY drivers (highest relevance score) BEFORE generic metrics like vol or beta.
+   Generic vol is already on Yahoo Finance — it adds zero value here.
+2. If a driver has relevance_score > 2.0 it is ACTIVELY IN PLAY. Lead with it.
+   Example: crude up 18% + airlines in news → lead with fuel cost, hedge ratio, unhedged P&L impact.
+3. Time horizon is {horizon}:
+   1 Week  → near-term catalysts, scheduled events, earnings, macro data releases
+   1 Month → trend, guidance changes, sector rotation
+   3 Months → regime change, fundamental shifts
+   1 Year  → thesis, balance sheet trajectory, competitive moat
+4. MINIMALISM: one key insight per sentence. Max 4 sentences per section. No bullets > 3 items.
+5. YOUR UNIQUE VALUE: connect sector driver to company-specific numbers from EDGAR/fundamentals.
+   BAD: "fuel prices are rising"
+   GOOD: "Jet fuel up 18% in 3 months. AAL hedges ~40% per 10-K. Unhedged 60% hits COGS directly."
+6. Every number you cite must come from the data provided. No fabrication."""
 
 
 def _build_context_block(ctx: dict) -> str:
@@ -375,108 +419,124 @@ def _build_context_block(ctx: dict) -> str:
     return "\n".join(lines)
 
 
-def generate_research_report(context: dict, web_results: list[dict]) -> str:
+def _build_driver_block(driver_profile: dict | None) -> str:
+    """Format driver profile into LLM prompt block."""
+    if not driver_profile:
+        return "(No driver profile available)"
+    lines = []
+    for d in driver_profile.get("factors", [])[:6]:
+        status = "⚠️ ACTIVE" if d.get("factor_is_moving") else "stable"
+        r1m = d.get("factor_1m_return")
+        r1m_str = f"{r1m:+.1f}%" if r1m is not None else "N/A"
+        vel = d.get("news_velocity", 0)
+        lines.append(
+            f"  [{d.get('priority','?')}] {d['name']} | factor: {d.get('external_factor','?')} | "
+            f"relevance: {d.get('current_relevance_score',0):.2f} | 1M: {r1m_str} | "
+            f"news: {vel:.1f}/2.0 | {status}"
+        )
+    return "\n".join(lines)
+
+
+def generate_research_report(
+    context: dict,
+    web_results: list[dict],
+    driver_profile: dict | None = None,
+) -> str:
     """
-    Generate full institutional research report via DeepSeek on OpenRouter.
-    Returns plain-text Markdown report string.
+    Generate insight-first, driver-led research report via DeepSeek on OpenRouter.
+    Returns plain-text Markdown string.
     """
     client = _get_openai()
     if not client:
         return "_AI report unavailable: OPENROUTER_API_KEY not set._"
 
+    horizon = context.get("horizon", "1 Month")
+    ticker = context["ticker"]
+    company = context["company"]
+    sector = context["sector"]
+    industry = context["industry"]
+
+    top_driver_name = context.get("top_driver_name")
+    top_driver_factor = context.get("top_driver_factor")
+    top_driver_score = context.get("top_driver_score")
+    top_driver_moving = context.get("top_driver_moving", False)
+
+    system_prompt = _make_analyst_system(
+        horizon, top_driver_name, top_driver_factor,
+        top_driver_score, top_driver_moving
+    )
+
     ctx_block = _build_context_block(context)
+    driver_block = _build_driver_block(driver_profile)
 
     web_block = ""
     if web_results:
         web_lines = []
         for i, r in enumerate(web_results, 1):
-            domain = r["url"].split("/")[2] if r["url"] else "unknown"
-            snippet = r["content"][:200].replace("\n", " ")
+            domain = r["url"].split("/")[2] if r.get("url") else "unknown"
+            snippet = (r.get("content") or "")[:200].replace("\n", " ")
             web_lines.append(f"{i}. {r['title']} | {domain}\n   {snippet}")
         web_block = "\n".join(web_lines)
     else:
-        web_block = "(No web research available — Tavily key not configured)"
+        web_block = "(No web research available)"
 
-    ticker = context["ticker"]
-    company = context["company"]
-    sector = context["sector"]
-    industry = context["industry"]
+    # Format key interpolated values safely
     risk_score = context.get("composite_risk_score", "N/A")
-    fund_score = context.get("fundamental_risk_score", "N/A")
-    divergence = context.get("divergence", "N/A")
-    vol_regime_val = context.get("vol_regime", "unknown")
-    vol_pct = context.get("vol_percentile", "N/A")
-    kurtosis = context.get("excess_kurtosis", "N/A")
-    cvar_99 = context.get("cvar_99", "N/A")
-    cvar_str = f"{cvar_99:.2%}" if isinstance(cvar_99, float) else str(cvar_99)
-    macro_regime = context.get("macro_regime", "UNKNOWN")
-    insider_signal = context.get("insider_signal", "NEUTRAL")
-    funds_adding = context.get("funds_adding", 0)
-    funds_reducing = context.get("funds_reducing", 0)
-    divergence_str = f"{divergence:.1f}" if isinstance(divergence, float) else str(divergence)
-    fund_score_str = f"{fund_score:.0f}" if isinstance(fund_score, float) else str(fund_score)
+    td_name = top_driver_name or "primary sector driver"
+    td_factor = top_driver_factor or "N/A"
 
-    user_prompt = f"""Generate a professional research report for {ticker} ({company}, {sector} / {industry}).
+    user_prompt = f"""Analyze {ticker} ({company}, {sector}/{industry}) for {horizon} risk horizon.
+
+=== TOP RISK DRIVERS (auto-ranked by relevance score) ===
+{driver_block}
 
 === QUANTITATIVE SNAPSHOT ===
 {ctx_block}
 
-=== RECENT WEB RESEARCH ===
+=== WEB RESEARCH (recent, driver-targeted) ===
 {web_block}
 
-=== REPORT STRUCTURE ===
-Write exactly these sections with these headers:
+=== REPORT — {horizon} HORIZON ===
+Write exactly these sections:
 
-## EXECUTIVE SUMMARY
-3-4 sentences. What is the single dominant risk theme right now? What should an experienced trader focus on?
+## WHAT YOU NEED TO KNOW RIGHT NOW
+1 short paragraph. Lead with the highest relevance_score driver.
+If any driver has relevance_score > 2.0: start there — it is actively in play.
+What should an experienced trader act on today that is NOT already in Yahoo Finance or WSJ?
 
-## RISK PROFILE: {risk_score}/100
-Explain what drives the score. Is risk appropriately priced vs sector peers? What's the #1 risk driver?
+## TOP 3 RISKS FOR {horizon}
+Specific to THIS company for THIS horizon.
+Risk #1 must be the highest-relevance driver if it is active.
+Each risk: what → why NOW → specific trigger level to watch.
 
-## VOLATILITY REGIME
-Current: {vol_regime_val} at {vol_pct}th percentile.
-Kurtosis {kurtosis} means: [interpret fat tails].
-What does the return distribution shape tell us about the TYPE of risk (jump risk vs diffuse vol)?
+## SECTOR DRIVER DEEP DIVE
+The #1 driver: {td_name} / factor: {td_factor}
+- Current state of {td_factor}: [from web research or data]
+- Company-specific exposure: [from fundamentals/EDGAR data]
+- Estimated P&L impact if driver shocks: [calculate from actual margins/COGS]
+- Hedging or mitigation in place: [from 10-K knowledge if applicable]
+- Outlook for {horizon}: [from web research]
 
-## TAIL RISK ASSESSMENT
-CVaR99 of {cvar_str} interpreted in plain terms.
-Is tail risk systematic (market beta) or idiosyncratic?
-What specific scenarios could trigger tail events for THIS company in THIS sector?
+## WHAT STANDARD PROVIDERS ARE MISSING
+One paragraph on what is not in the price and not covered by Yahoo Finance/WSJ.
+Why does it matter specifically for {horizon}?
 
-## SMART MONEY POSITIONING
-Insider signal: {insider_signal}
-Funds adding: {funds_adding} | Reducing: {funds_reducing}
-Synthesize the complete smart money narrative.
-Flag contradictions between insider and institutional signals.
-Historical base rate: when insiders show this pattern, what typically happens over 30/60/90 days?
+## NEAR-TERM CATALYSTS
+From web research only. Events in next {horizon} that could move the stock.
+If none found: state explicitly "No material catalysts identified for {horizon} horizon."
 
-## FUNDAMENTAL vs MARKET RISK DIVERGENCE
-Divergence: {divergence_str} points
-({risk_score} market vs {fund_score_str} fundamental)
-What is the market pricing that fundamentals don't confirm?
-Resolution: which signal has historically been correct in similar setups?
+## RISK SCORE CONTEXT: {risk_score}/100
+What specifically drives this score for {company}?
+Is it appropriately priced vs sector peers?
 
-## MACRO REGIME SENSITIVITY
-Regime: {macro_regime}
-How does {company}'s specific business model interact with: current rate level, credit spreads, sector dynamics, and the VIX regime? Quantify where possible.
-
-## KEY RISKS — MONITOR THESE
-List exactly 5 risks with specific trigger levels:
-Format: "RISK: [name] | Trigger: [specific metric at specific level] | Historical impact: [what happened]"
-
-## RECENT MATERIAL DEVELOPMENTS
-From web research — material news ONLY (earnings, guidance, credit, M&A, regulatory, sector disruption).
-For each: [Source] [Headline] [Why it matters for risk]
-Exclude generic price commentary.
-
-=== CONFIDENCE RATINGS ===
-Rate each section HIGH/MEDIUM/LOW based on data quality."""
+## BOTTOM LINE
+One sentence: risk/reward for {horizon}. Confidence: HIGH/MEDIUM/LOW and why."""
 
     try:
         resp = client.chat.completions.create(
             model="deepseek/deepseek-chat",
             messages=[
-                {"role": "system", "content": _ANALYST_SYSTEM},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             max_tokens=4000,
@@ -494,44 +554,73 @@ def chat_with_analyst(
     question: str,
     context: dict,
     chat_history: list[dict],
+    driver_profile: dict | None = None,
     use_web: bool = True,
 ) -> str:
     """
-    Answer a follow-up question using full context + chat history.
-    If question touches sector/macro keywords, fetch fresh web results.
+    Answer a follow-up question in PM-briefing format.
+    Always references primary sector driver. Fetches web for macro questions.
     """
     client = _get_openai()
     if not client:
         return "_Chat unavailable: OPENROUTER_API_KEY not set._"
 
+    horizon = context.get("horizon", "1 Month")
+    top_driver_name = context.get("top_driver_name", "primary risk factor")
+    top_driver_factor = context.get("top_driver_factor", "unknown")
+    top_driver_score = context.get("top_driver_score")
+    top_driver_moving = context.get("top_driver_moving", False)
+    score_str = f"{top_driver_score:.2f}" if top_driver_score is not None else "N/A"
+
     ctx_block = _build_context_block(context)
-    system_content = f"""{_ANALYST_SYSTEM}
 
-=== STOCK UNDER ANALYSIS ===
-Ticker: {context['ticker']} | Company: {context['company']}
-Sector: {context['sector']} | Industry: {context['industry']}
+    system_content = f"""You are a senior equity risk analyst. Answer like briefing a PM before market open.
 
-=== CURRENT QUANTITATIVE DATA ===
+Stock: {context['ticker']} | {context['company']} | {context['sector']} / {context['industry']}
+Horizon: {horizon}
+
+PRIMARY RISK DRIVER RIGHT NOW:
+{top_driver_name} — {top_driver_factor}
+Relevance: {score_str}/3.0+ | Moving: {"YES" if top_driver_moving else "no"}
+
+=== CURRENT DATA ===
 {ctx_block}
 
-Always ground answers in the ACTUAL numbers above. Be concise but precise."""
+RESPONSE FORMAT — always use this structure:
+🎯 [Direct answer in one sentence]
 
-    # Optionally fetch web context for domain questions
+KEY FACTORS:
+- [Most important — must relate to primary driver first if risk-related]
+- [Second factor]
+- [Third factor — optional]
+
+⚠️ WATCH: [1-2 specific signals to monitor with trigger levels]
+
+CONFIDENCE: HIGH/MEDIUM/LOW
+
+RULES:
+- Never start with "DATA SHOWS:" — you are an analyst, not a terminal.
+- Always mention {top_driver_name} if the question is risk-related.
+- Generic vol/beta answers belong on Yahoo Finance. Your value is sector-specific + company-specific.
+- Total response under 200 words."""
+
+    # Fetch web context for macro/sector questions
     web_ctx = ""
     if use_web:
         domain_keywords = [
             "sector", "industry", "fuel", "rates", "recession", "regulation",
             "competition", "macro", "inflation", "fed", "interest", "credit",
-            "oil", "gas", "currency", "usd", "yield", "spread",
+            "oil", "gas", "currency", "usd", "yield", "spread", "tariff",
         ]
         if any(kw in question.lower() for kw in domain_keywords):
             try:
                 web_hits = fetch_web_research(
-                    context["ticker"], context["company"], context["sector"]
+                    context["ticker"], context["company"], context["sector"],
+                    driver_profile=driver_profile, horizon=horizon,
                 )
                 if web_hits:
                     snippets = [
-                        f"- {r['title']}: {r['content'][:150]}"
+                        f"- {r['title']}: {(r.get('content') or '')[:150]}"
                         for r in web_hits[:4]
                     ]
                     web_ctx = "\n\n=== RECENT WEB CONTEXT ===\n" + "\n".join(snippets)
@@ -539,7 +628,6 @@ Always ground answers in the ACTUAL numbers above. Be concise but precise."""
                 pass
 
     messages = [{"role": "system", "content": system_content + web_ctx}]
-    # Add chat history (last 10 turns to stay within token budget)
     for msg in chat_history[-10:]:
         if msg.get("role") in ("user", "assistant"):
             messages.append({"role": msg["role"], "content": msg["content"]})
@@ -549,7 +637,7 @@ Always ground answers in the ACTUAL numbers above. Be concise but precise."""
         resp = client.chat.completions.create(
             model="deepseek/deepseek-chat",
             messages=messages,
-            max_tokens=1500,
+            max_tokens=500,
             temperature=0.4,
         )
         return resp.choices[0].message.content
