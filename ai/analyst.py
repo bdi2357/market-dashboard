@@ -213,7 +213,7 @@ def build_ticker_context(
         "max_drawdown": round(float(mdd_data["max_drawdown"]), 4),
         "calmar": round(float(calmar_ratio(prices)), 3),
         "sortino": round(float(sortino_ratio(prices)), 3),
-        "ulcer_index": round(float(ulcer_index(prices)), 4),
+        "ulcer_index": round(float(ulcer_index(prices).iloc[-1]), 4),
         "var_95": round(float(var_data["var_95"]), 4),
         "var_99": round(float(var_data["var_99"]), 4),
         "cvar_95": round(float(var_data["cvar_95"]), 4),
@@ -222,7 +222,7 @@ def build_ticker_context(
         "excess_kurtosis": round(float(r.kurtosis()), 3),
         "beta_spy": round(_beta, 3) if not np.isnan(_beta) else None,
         "idiosyncratic_risk_pct": round(_idio_pct, 1) if _idio_pct and not np.isnan(_idio_pct) else None,
-        "information_ratio": round(float(_ir.iloc[-1]), 3) if not _ir.empty else None,
+        "information_ratio": round(float(_ir), 3) if _ir is not None and not np.isnan(_ir) else None,
         # Macro
         **macro_ctx,
         # Fundamentals
