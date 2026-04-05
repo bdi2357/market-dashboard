@@ -344,10 +344,12 @@ def _make_analyst_system(horizon: str, top_driver_name: str | None, top_driver_f
     moving_str = "YES — actively moving" if top_driver_moving else "stable"
     driver_note = ""
     if top_driver_name:
+        _score_fmt = f"{top_driver_score:.2f}" if top_driver_score is not None else "N/A"
+        _active_str = "⚠️ ACTIVE" if top_driver_moving else "stable"
         driver_note = f"""
 PRIMARY DRIVER IN EFFECT: {top_driver_name}
 External factor: {top_driver_factor}
-Relevance score: {top_driver_score:.2f if top_driver_score else 'N/A'} — {"⚠️ ACTIVE" if top_driver_moving else "stable"}
+Relevance score: {_score_fmt} — {_active_str}
 """
     return f"""You are a senior equity risk analyst at a quantitative hedge fund.
 Your edge: surfacing NON-OBVIOUS risks that standard providers (Yahoo Finance, WSJ) miss.
@@ -781,3 +783,5 @@ def get_quick_synopsis(
     except Exception as e:
         logger.warning(f"Synopsis failed: {e}")
         return ""
+
+
