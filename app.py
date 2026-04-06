@@ -2195,13 +2195,22 @@ with tab6:
 
             # Resolve pending suggested-question click
             _pending = st.session_state.pop("_pending_q", None)
+            if _pending:
+                st.session_state[f"_chat_prefill_{_ticker}"] = _pending
 
-            # Chat input
-            _question = st.chat_input(
-                f"e.g. What is {_ticker}'s biggest risk given current {_top_driver_name} levels?",
-                key=f"chat_input_{_ticker}",
+            # ── Text input + Send button (avoids st.chat_input rerun) ─────────
+            _prefill = st.session_state.pop(f"_chat_prefill_{_ticker}", "")
+            _txt_col, _btn_col = st.columns([5, 1])
+            _typed = _txt_col.text_input(
+                "Ask your question:",
+                value=_prefill,
+                key=f"chat_text_{_ticker}",
+                label_visibility="collapsed",
+                placeholder=f"e.g. What is {_ticker}'s biggest risk right now?",
             )
-            _active_q = _pending or _question
+            _send = _btn_col.button("Send", key=f"chat_send_{_ticker}", use_container_width=True)
+
+            _active_q = _typed.strip() if _send and _typed.strip() else None
 
             if _active_q and _ai_ctx:
                 st.session_state[_chat_key].append(
@@ -2225,9 +2234,7 @@ with tab6:
                 st.session_state[_chat_key].append(
                     {"role": "assistant", "content": _answer}
                 )
-                # No st.rerun() — Streamlit handles naturally
 
             if st.session_state[_chat_key]:
                 if st.button("🗑️ Clear chat", key=f"clear_chat_{_ticker}"):
                     st.session_state[_chat_key] = []
-                    # No rerun needed
