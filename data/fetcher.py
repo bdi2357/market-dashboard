@@ -17,7 +17,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 CACHE_DIR = Path(__file__).parent / "cache"
-CACHE_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Path to secrets.toml relative to this file (../../.streamlit/secrets.toml)
 _SECRETS_PATH = Path(__file__).parent.parent / ".streamlit" / "secrets.toml"

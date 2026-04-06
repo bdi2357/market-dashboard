@@ -25,7 +25,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 CACHE_DIR = Path(__file__).parent / "cache"
-CACHE_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _HEADERS = {"User-Agent": "market-dashboard itaybd@gmail.com"}
 

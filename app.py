@@ -26,14 +26,15 @@ from plotly.subplots import make_subplots
 from datetime import date, timedelta
 import yfinance as yf
 
-# Inject FRED API key from Streamlit secrets into the environment so
-# data/fetcher.py (which reads os.environ) can find it without requiring
-# the user to set the env var manually before launching Streamlit.
-if "FRED_API_KEY" not in os.environ:
-    try:
-        os.environ["FRED_API_KEY"] = st.secrets["FRED_API_KEY"]
-    except (KeyError, FileNotFoundError):
-        pass
+# Inject API keys from Streamlit secrets (Streamlit Cloud) into os.environ so
+# all downstream modules that use os.getenv() work without modification.
+# On local dev, keys come from .env (loaded by analyst.py via python-dotenv).
+for _secret_key in ("FRED_API_KEY", "OPENROUTER_API_KEY", "TAVILY_API_KEY"):
+    if _secret_key not in os.environ:
+        try:
+            os.environ[_secret_key] = st.secrets[_secret_key]
+        except (KeyError, FileNotFoundError):
+            pass
 
 from data.fetcher import (
     fetch_ohlcv, fetch_ticker_info, get_sector_etf,
