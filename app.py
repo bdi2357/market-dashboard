@@ -80,6 +80,7 @@ def init_session_state():
         "fast_ma": 20,
         "slow_ma": 50,
         "sizing_method": "vol_target",
+        "nav_page": "🎯 Risk Summary",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -120,6 +121,18 @@ with st.sidebar:
             if _k.startswith("ai_report_") or _k.startswith("ai_ctx_") or _k.startswith("synopsis_"):
                 del st.session_state[_k]
         st.session_state["horizon"] = horizon
+    _page = st.radio(
+        "Navigate to",
+        [
+            "🎯 Risk Summary",
+            "📊 Market Risk",
+            "🌍 Macro & Regime",
+            "🏛️ Smart Money & Factors",
+            "📋 Fundamentals",
+            "🤖 AI Analyst",
+        ],
+        key="nav_page",
+    )
     st.divider()
     load = st.button("🚀 Load Data", type="primary", use_container_width=True)
     if st.session_state.get("data_loaded") and st.session_state.get("current_ticker") == ticker:
@@ -211,20 +224,16 @@ simple_r = prices.pct_change().dropna()
 # Retrieve horizon from session state (set in sidebar)
 _horizon = st.session_state.get("horizon", "1 Month")
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "🎯 Risk Summary",
-    "📊 Market Risk",
-    "🌍 Macro & Regime",
-    "🏛️ Smart Money & Factors",
-    "📋 Fundamentals",
-    "🤖 AI Analyst",
-])
+# ── Sidebar radio drives page rendering — survives all reruns incl. chat_input ─
+_page = st.session_state.get("nav_page", "🎯 Risk Summary")
+# Sentinels: populated only when their parent page is active
+_mkt_s1 = _mkt_s2 = _mkt_s3 = _mkt_s4 = None
+_sm_s1 = _sm_s2 = None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — RISK SCORECARD
+# PAGE 1 — RISK SCORECARD
 # ══════════════════════════════════════════════════════════════════════════════
-with tab1:
+if _page == "🎯 Risk Summary":
     st.subheader(f"Risk Scorecard — {_ticker}")
 
     # ── RISK ALERTS ───────────────────────────────────────────────────────────
@@ -461,355 +470,358 @@ with tab1:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — MARKET RISK (Volatility · Tail Risk · Relative Risk · Backtester)
+# PAGE 2 — MARKET RISK (Volatility · Tail Risk · Relative Risk · Backtester)
 # ══════════════════════════════════════════════════════════════════════════════
-with tab2:
+elif _page == "📊 Market Risk":
     _mkt_s1, _mkt_s2, _mkt_s3, _mkt_s4 = st.tabs([
         "📈 Volatility Surface", "⚠️ Tail Risk", "🔗 Relative Risk", "🧪 Backtester",
     ])
 
-with _mkt_s1:
-    st.subheader("Volatility Cone & Regime")
-
-    vol_df = rolling_realized_vol(prices, windows=[10, 21, 63, 252])
-    skk_df = rolling_skew_kurt(prices)
-
-    # Vol cone chart
-    fig_vol = go.Figure()
-    colors = {"vol_10d": "#e74c3c", "vol_21d": "#f39c12", "vol_63d": "#2ecc71", "vol_252d": "#3498db"}
-    for col, color in colors.items():
-        label = col.replace("vol_", "").replace("d", "d Realized Vol")
-        fig_vol.add_trace(go.Scatter(x=vol_df.index, y=vol_df[col], name=label, line=dict(color=color)))
-
-    # Percentile bands for 21d vol + spike annotations
-    v21 = vol_df["vol_21d"].dropna()
-    p95 = pd.Series(dtype=float)
-    if len(v21) > 40:
-        p25 = v21.rolling(252, min_periods=60).quantile(0.25)
-        p75 = v21.rolling(252, min_periods=60).quantile(0.75)
-        p95 = v21.rolling(252, min_periods=60).quantile(0.95)
-        fig_vol.add_trace(go.Scatter(x=v21.index, y=p95, name="95th pct (21d)", line=dict(color="white", dash="dot", width=1)))
-        fig_vol.add_trace(go.Scatter(x=v21.index, y=p75, name="75th pct (21d)", line=dict(color="gray", dash="dot", width=1)))
-        fig_vol.add_trace(go.Scatter(x=v21.index, y=p25, name="25th pct (21d)", line=dict(color="gray", dash="dot", width=1), fill="tonexty", fillcolor="rgba(100,100,100,0.1)"))
-
-        # Detect spikes: 10d vol > 95th pct of its own history, group into events
-        v10 = vol_df["vol_10d"].dropna()
-        p95_10 = v10.rolling(252, min_periods=60).quantile(0.95)
-        spike_mask = v10 > p95_10
-        spike_events = []
-        in_spike = False
-        spike_start = None
-        spike_peak_val = 0
-        spike_peak_date = None
-        for dt in v10.index:
-            if spike_mask.get(dt, False):
-                if not in_spike:
-                    in_spike = True
-                    spike_start = dt
-                    spike_peak_val = v10[dt]
-                    spike_peak_date = dt
-                elif v10[dt] > spike_peak_val:
-                    spike_peak_val = v10[dt]
-                    spike_peak_date = dt
-            else:
-                if in_spike:
-                    spike_events.append((spike_peak_date, spike_peak_val, p95_10.get(spike_peak_date, spike_peak_val)))
-                    in_spike = False
-        if in_spike:
-            spike_events.append((spike_peak_date, spike_peak_val, p95_10.get(spike_peak_date, spike_peak_val)))
-
-        # Annotate top-5 spikes by magnitude
-        spike_events.sort(key=lambda x: x[1], reverse=True)
-        for sp_date, sp_val, sp_p95 in spike_events[:5]:
-            pct_above = (sp_val / sp_p95 - 1) * 100 if sp_p95 > 0 else 0
-            fig_vol.add_annotation(
-                x=sp_date, y=sp_val,
-                text=f"Spike +{pct_above:.0f}% above 95th",
-                showarrow=True, arrowhead=2, arrowcolor="#e74c3c",
-                font=dict(size=10, color="#e74c3c"),
-                bgcolor="rgba(30,30,46,0.85)",
-                yshift=10,
+if _mkt_s1 is not None:
+    with _mkt_s1:
+        st.subheader("Volatility Cone & Regime")
+    
+        vol_df = rolling_realized_vol(prices, windows=[10, 21, 63, 252])
+        skk_df = rolling_skew_kurt(prices)
+    
+        # Vol cone chart
+        fig_vol = go.Figure()
+        colors = {"vol_10d": "#e74c3c", "vol_21d": "#f39c12", "vol_63d": "#2ecc71", "vol_252d": "#3498db"}
+        for col, color in colors.items():
+            label = col.replace("vol_", "").replace("d", "d Realized Vol")
+            fig_vol.add_trace(go.Scatter(x=vol_df.index, y=vol_df[col], name=label, line=dict(color=color)))
+    
+        # Percentile bands for 21d vol + spike annotations
+        v21 = vol_df["vol_21d"].dropna()
+        p95 = pd.Series(dtype=float)
+        if len(v21) > 40:
+            p25 = v21.rolling(252, min_periods=60).quantile(0.25)
+            p75 = v21.rolling(252, min_periods=60).quantile(0.75)
+            p95 = v21.rolling(252, min_periods=60).quantile(0.95)
+            fig_vol.add_trace(go.Scatter(x=v21.index, y=p95, name="95th pct (21d)", line=dict(color="white", dash="dot", width=1)))
+            fig_vol.add_trace(go.Scatter(x=v21.index, y=p75, name="75th pct (21d)", line=dict(color="gray", dash="dot", width=1)))
+            fig_vol.add_trace(go.Scatter(x=v21.index, y=p25, name="25th pct (21d)", line=dict(color="gray", dash="dot", width=1), fill="tonexty", fillcolor="rgba(100,100,100,0.1)"))
+    
+            # Detect spikes: 10d vol > 95th pct of its own history, group into events
+            v10 = vol_df["vol_10d"].dropna()
+            p95_10 = v10.rolling(252, min_periods=60).quantile(0.95)
+            spike_mask = v10 > p95_10
+            spike_events = []
+            in_spike = False
+            spike_start = None
+            spike_peak_val = 0
+            spike_peak_date = None
+            for dt in v10.index:
+                if spike_mask.get(dt, False):
+                    if not in_spike:
+                        in_spike = True
+                        spike_start = dt
+                        spike_peak_val = v10[dt]
+                        spike_peak_date = dt
+                    elif v10[dt] > spike_peak_val:
+                        spike_peak_val = v10[dt]
+                        spike_peak_date = dt
+                else:
+                    if in_spike:
+                        spike_events.append((spike_peak_date, spike_peak_val, p95_10.get(spike_peak_date, spike_peak_val)))
+                        in_spike = False
+            if in_spike:
+                spike_events.append((spike_peak_date, spike_peak_val, p95_10.get(spike_peak_date, spike_peak_val)))
+    
+            # Annotate top-5 spikes by magnitude
+            spike_events.sort(key=lambda x: x[1], reverse=True)
+            for sp_date, sp_val, sp_p95 in spike_events[:5]:
+                pct_above = (sp_val / sp_p95 - 1) * 100 if sp_p95 > 0 else 0
+                fig_vol.add_annotation(
+                    x=sp_date, y=sp_val,
+                    text=f"Spike +{pct_above:.0f}% above 95th",
+                    showarrow=True, arrowhead=2, arrowcolor="#e74c3c",
+                    font=dict(size=10, color="#e74c3c"),
+                    bgcolor="rgba(30,30,46,0.85)",
+                    yshift=10,
+                )
+    
+        fig_vol.update_layout(title="Realized Volatility Cone with Spike Annotations", yaxis_title="Annualized Vol", template=DARK, height=420)
+        st.plotly_chart(fig_vol, use_container_width=True)
+    
+        # ── VOL REGIME COLOR BAR ──────────────────────────────────────────────────
+        if len(v21) > 40:
+            _regime_s = vol_regime(v21)
+            _regime_color_map = {"low": "#2ecc71", "normal": "#3498db", "high": "#f39c12", "extreme": "#e74c3c"}
+            _rdf = pd.DataFrame({"regime": _regime_s, "y": 1}, index=v21.index).dropna()
+            fig_rbar = go.Figure()
+            for _reg, _rc in _regime_color_map.items():
+                _mask = _rdf["regime"] == _reg
+                if _mask.any():
+                    fig_rbar.add_trace(go.Bar(
+                        x=_rdf.index[_mask], y=[1]*_mask.sum(),
+                        name=_reg, marker_color=_rc, showlegend=True,
+                    ))
+            fig_rbar.update_layout(
+                barmode="stack", title="Vol Regime Timeline (21d)",
+                yaxis=dict(showticklabels=False, showgrid=False),
+                height=80, template=DARK, margin=dict(t=30, b=20),
+                legend=dict(orientation="h"),
+            )
+            st.plotly_chart(fig_rbar, use_container_width=True)
+    
+        # ── TOP VOL SPIKES TABLE ──────────────────────────────────────────────────
+        if len(v21) > 40 and spike_events:
+            st.subheader("Top Vol Spike Periods")
+            _spike_rows = []
+            for sp_date, sp_val, sp_p95 in spike_events[:5]:
+                _pct_above = (sp_val / sp_p95 - 1) * 100 if sp_p95 > 0 else 0
+                _spike_rows.append({
+                    "Date": str(sp_date)[:10],
+                    "10d Realized Vol": f"{sp_val:.1%}",
+                    "95th Pct Threshold": f"{sp_p95:.1%}",
+                    "% Above Threshold": f"+{_pct_above:.0f}%",
+                })
+            st.dataframe(pd.DataFrame(_spike_rows), use_container_width=True, hide_index=True)
+    
+        # Vol regime coloring
+        regime_labels = vol_regime(vol_df["vol_21d"].dropna())
+        regime_colors_map = {"low": "#2ecc71", "normal": "#3498db", "high": "#f39c12", "extreme": "#e74c3c", "unknown": "#7f8c8d"}
+    
+        fig_regime = go.Figure()
+        fig_regime.add_trace(go.Scatter(
+            x=vol_df.index, y=vol_df["vol_21d"],
+            mode="lines", name="21d Vol",
+            line=dict(color="white", width=1),
+        ))
+        # Add colored background by regime
+        for regime, color in regime_colors_map.items():
+            mask = (regime_labels == regime)
+            if mask.any():
+                idx = vol_df["vol_21d"].index[vol_df["vol_21d"].index.isin(mask[mask].index)]
+                fig_regime.add_trace(go.Scatter(
+                    x=idx, y=vol_df["vol_21d"].reindex(idx),
+                    mode="markers", marker=dict(color=color, size=3),
+                    name=f"Regime: {regime}", showlegend=True,
+                ))
+        fig_regime.update_layout(title="Vol Regime (21d) — colored by quartile vs 2Y history", template=DARK, height=300)
+        st.plotly_chart(fig_regime, use_container_width=True)
+    
+        # Skew/Kurtosis
+        fig_sk = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=["Rolling 63d Skewness", "Rolling 63d Excess Kurtosis"])
+        fig_sk.add_trace(go.Scatter(x=skk_df.index, y=skk_df["skewness"], name="Skewness", line=dict(color="#e74c3c")), row=1, col=1)
+        fig_sk.add_hline(y=1, line_dash="dot", line_color="white", row=1, col=1)
+        fig_sk.add_hline(y=-1, line_dash="dot", line_color="white", row=1, col=1)
+        fig_sk.add_trace(go.Scatter(x=skk_df.index, y=skk_df["excess_kurtosis"], name="Excess Kurtosis", line=dict(color="#f39c12")), row=2, col=1)
+        fig_sk.add_hline(y=3, line_dash="dot", line_color="white", row=2, col=1)
+        fig_sk.update_layout(template=DARK, height=400, title="Higher moments — flag when |skew|>1 or kurt>3")
+        st.plotly_chart(fig_sk, use_container_width=True)
+    
+        # ── INTERPRETIVE COMMENTARY ───────────────────────────────────────────────
+        _v21_last = vol_df["vol_21d"].dropna().iloc[-1] if not vol_df["vol_21d"].dropna().empty else np.nan
+        _v252_last = vol_df["vol_252d"].dropna().iloc[-1] if not vol_df["vol_252d"].dropna().empty else np.nan
+        _skew_last = skk_df["skewness"].dropna().iloc[-1] if not skk_df["skewness"].dropna().empty else np.nan
+        _kurt_last  = skk_df["excess_kurtosis"].dropna().iloc[-1] if not skk_df["excess_kurtosis"].dropna().empty else np.nan
+        _vol_bullets = []
+        if not np.isnan(_v21_last):
+            _regime_now = str(vol_regime(vol_df["vol_21d"].dropna()).iloc[-1]) if not vol_df["vol_21d"].dropna().empty else "unknown"
+            _vol_bullets.append(f"Current 21d realized vol is **{_v21_last:.1%}** (annualized) — vol regime is **{_regime_now}** relative to 2-year history.")
+        if not np.isnan(_v21_last) and not np.isnan(_v252_last):
+            _ratio = _v21_last / _v252_last
+            _dir = "above" if _ratio > 1 else "below"
+            _vol_bullets.append(f"Short-term vol ({_v21_last:.1%}) is **{_ratio:.1f}x** the 1-year average ({_v252_last:.1%}) — vol is currently {_dir} its long-run baseline.")
+        if not np.isnan(_skew_last):
+            _skew_interp = "right-skewed (large positive outliers more likely)" if _skew_last > 0.5 else "left-skewed (large negative outliers more likely)" if _skew_last < -0.5 else "roughly symmetric"
+            _vol_bullets.append(f"Rolling skewness ({_skew_last:.2f}) — returns are {_skew_interp}.")
+        if not np.isnan(_kurt_last) and _kurt_last > 3:
+            _vol_bullets.append(f"Excess kurtosis ({_kurt_last:.2f}) is well above 3 — extreme moves occur far more often than a normal distribution predicts. Standard deviation understates risk.")
+        if _vol_bullets:
+            _bullet_html = "".join(f"<li style='margin-bottom:4px'>{b}</li>" for b in _vol_bullets)
+            st.markdown(
+                f"<div style='background:#1a1a2e;border-left:4px solid #3498db;padding:12px 16px;border-radius:4px;margin-top:8px'>"
+                f"<b style='color:#3498db'>What this means for {_ticker}:</b>"
+                f"<ul style='margin-top:8px;color:#ddd;font-size:13px'>{_bullet_html}</ul></div>",
+                unsafe_allow_html=True,
             )
 
-    fig_vol.update_layout(title="Realized Volatility Cone with Spike Annotations", yaxis_title="Annualized Vol", template=DARK, height=420)
-    st.plotly_chart(fig_vol, use_container_width=True)
 
-    # ── VOL REGIME COLOR BAR ──────────────────────────────────────────────────
-    if len(v21) > 40:
-        _regime_s = vol_regime(v21)
-        _regime_color_map = {"low": "#2ecc71", "normal": "#3498db", "high": "#f39c12", "extreme": "#e74c3c"}
-        _rdf = pd.DataFrame({"regime": _regime_s, "y": 1}, index=v21.index).dropna()
-        fig_rbar = go.Figure()
-        for _reg, _rc in _regime_color_map.items():
-            _mask = _rdf["regime"] == _reg
-            if _mask.any():
-                fig_rbar.add_trace(go.Bar(
-                    x=_rdf.index[_mask], y=[1]*_mask.sum(),
-                    name=_reg, marker_color=_rc, showlegend=True,
-                ))
-        fig_rbar.update_layout(
-            barmode="stack", title="Vol Regime Timeline (21d)",
-            yaxis=dict(showticklabels=False, showgrid=False),
-            height=80, template=DARK, margin=dict(t=30, b=20),
-            legend=dict(orientation="h"),
-        )
-        st.plotly_chart(fig_rbar, use_container_width=True)
-
-    # ── TOP VOL SPIKES TABLE ──────────────────────────────────────────────────
-    if len(v21) > 40 and spike_events:
-        st.subheader("Top Vol Spike Periods")
-        _spike_rows = []
-        for sp_date, sp_val, sp_p95 in spike_events[:5]:
-            _pct_above = (sp_val / sp_p95 - 1) * 100 if sp_p95 > 0 else 0
-            _spike_rows.append({
-                "Date": str(sp_date)[:10],
-                "10d Realized Vol": f"{sp_val:.1%}",
-                "95th Pct Threshold": f"{sp_p95:.1%}",
-                "% Above Threshold": f"+{_pct_above:.0f}%",
-            })
-        st.dataframe(pd.DataFrame(_spike_rows), use_container_width=True, hide_index=True)
-
-    # Vol regime coloring
-    regime_labels = vol_regime(vol_df["vol_21d"].dropna())
-    regime_colors_map = {"low": "#2ecc71", "normal": "#3498db", "high": "#f39c12", "extreme": "#e74c3c", "unknown": "#7f8c8d"}
-
-    fig_regime = go.Figure()
-    fig_regime.add_trace(go.Scatter(
-        x=vol_df.index, y=vol_df["vol_21d"],
-        mode="lines", name="21d Vol",
-        line=dict(color="white", width=1),
-    ))
-    # Add colored background by regime
-    for regime, color in regime_colors_map.items():
-        mask = (regime_labels == regime)
-        if mask.any():
-            idx = vol_df["vol_21d"].index[vol_df["vol_21d"].index.isin(mask[mask].index)]
-            fig_regime.add_trace(go.Scatter(
-                x=idx, y=vol_df["vol_21d"].reindex(idx),
-                mode="markers", marker=dict(color=color, size=3),
-                name=f"Regime: {regime}", showlegend=True,
-            ))
-    fig_regime.update_layout(title="Vol Regime (21d) — colored by quartile vs 2Y history", template=DARK, height=300)
-    st.plotly_chart(fig_regime, use_container_width=True)
-
-    # Skew/Kurtosis
-    fig_sk = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=["Rolling 63d Skewness", "Rolling 63d Excess Kurtosis"])
-    fig_sk.add_trace(go.Scatter(x=skk_df.index, y=skk_df["skewness"], name="Skewness", line=dict(color="#e74c3c")), row=1, col=1)
-    fig_sk.add_hline(y=1, line_dash="dot", line_color="white", row=1, col=1)
-    fig_sk.add_hline(y=-1, line_dash="dot", line_color="white", row=1, col=1)
-    fig_sk.add_trace(go.Scatter(x=skk_df.index, y=skk_df["excess_kurtosis"], name="Excess Kurtosis", line=dict(color="#f39c12")), row=2, col=1)
-    fig_sk.add_hline(y=3, line_dash="dot", line_color="white", row=2, col=1)
-    fig_sk.update_layout(template=DARK, height=400, title="Higher moments — flag when |skew|>1 or kurt>3")
-    st.plotly_chart(fig_sk, use_container_width=True)
-
-    # ── INTERPRETIVE COMMENTARY ───────────────────────────────────────────────
-    _v21_last = vol_df["vol_21d"].dropna().iloc[-1] if not vol_df["vol_21d"].dropna().empty else np.nan
-    _v252_last = vol_df["vol_252d"].dropna().iloc[-1] if not vol_df["vol_252d"].dropna().empty else np.nan
-    _skew_last = skk_df["skewness"].dropna().iloc[-1] if not skk_df["skewness"].dropna().empty else np.nan
-    _kurt_last  = skk_df["excess_kurtosis"].dropna().iloc[-1] if not skk_df["excess_kurtosis"].dropna().empty else np.nan
-    _vol_bullets = []
-    if not np.isnan(_v21_last):
-        _regime_now = str(vol_regime(vol_df["vol_21d"].dropna()).iloc[-1]) if not vol_df["vol_21d"].dropna().empty else "unknown"
-        _vol_bullets.append(f"Current 21d realized vol is **{_v21_last:.1%}** (annualized) — vol regime is **{_regime_now}** relative to 2-year history.")
-    if not np.isnan(_v21_last) and not np.isnan(_v252_last):
-        _ratio = _v21_last / _v252_last
-        _dir = "above" if _ratio > 1 else "below"
-        _vol_bullets.append(f"Short-term vol ({_v21_last:.1%}) is **{_ratio:.1f}x** the 1-year average ({_v252_last:.1%}) — vol is currently {_dir} its long-run baseline.")
-    if not np.isnan(_skew_last):
-        _skew_interp = "right-skewed (large positive outliers more likely)" if _skew_last > 0.5 else "left-skewed (large negative outliers more likely)" if _skew_last < -0.5 else "roughly symmetric"
-        _vol_bullets.append(f"Rolling skewness ({_skew_last:.2f}) — returns are {_skew_interp}.")
-    if not np.isnan(_kurt_last) and _kurt_last > 3:
-        _vol_bullets.append(f"Excess kurtosis ({_kurt_last:.2f}) is well above 3 — extreme moves occur far more often than a normal distribution predicts. Standard deviation understates risk.")
-    if _vol_bullets:
-        _bullet_html = "".join(f"<li style='margin-bottom:4px'>{b}</li>" for b in _vol_bullets)
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKET RISK — TAIL RISK
+# ══════════════════════════════════════════════════════════════════════════════
+if _mkt_s2 is not None:
+    with _mkt_s2:
+        st.subheader("Tail Risk Analysis")
+    
+        r = simple_r
+        hist = historical_var_cvar(r)
+        param = parametric_var(r)
+        cf = cornish_fisher_var(r)
+    
+        # Return distribution with VaR lines
+        fig_dist = go.Figure()
+        fig_dist.add_trace(go.Histogram(
+            x=r, nbinsx=100, name="Daily Returns",
+            marker_color="#3498db", opacity=0.7,
+            histnorm="probability density",
+        ))
+        # Normal fit overlay
+        xs = np.linspace(r.min(), r.max(), 300)
+        fig_dist.add_trace(go.Scatter(
+            x=xs, y=pd.Series(xs).apply(lambda x: __import__("scipy.stats", fromlist=["norm"]).norm.pdf(x, r.mean(), r.std())),
+            name="Normal Fit", line=dict(color="white", dash="dash"),
+        ))
+        var_lines = [
+            ("VaR 95% Hist", -hist["var_95"], "#f39c12"),
+            ("VaR 99% Hist", -hist["var_99"], "#e74c3c"),
+            ("CVaR 99%", -hist["cvar_99"], "#c0392b"),
+            ("VaR 99% CF", -cf.get("var_cf_99", hist["var_99"]), "#8e44ad"),
+        ]
+        for label, x_val, color in var_lines:
+            fig_dist.add_vline(x=x_val, line_color=color, line_dash="dot", annotation_text=label, annotation_font_color=color)
+        fig_dist.update_layout(title="Return Distribution with VaR/CVaR Overlays", template=DARK, height=400)
+        st.plotly_chart(fig_dist, use_container_width=True)
+    
+        # QQ plot
+        from scipy import stats as sp_stats
+        (osm, osr), (slope, intercept, r_val) = sp_stats.probplot(r, dist="norm")
+        fig_qq = go.Figure()
+        fig_qq.add_trace(go.Scatter(x=osm, y=osr, mode="markers", name="Quantiles", marker=dict(color="#3498db", size=3)))
+        fig_qq.add_trace(go.Scatter(
+            x=[min(osm), max(osm)],
+            y=[slope * min(osm) + intercept, slope * max(osm) + intercept],
+            mode="lines", name="Normal line", line=dict(color="white", dash="dash"),
+        ))
+        fig_qq.update_layout(title="QQ Plot vs Normal (fat tails = points above line at extremes)", xaxis_title="Theoretical Quantiles", yaxis_title="Sample Quantiles", template=DARK, height=350)
+        st.plotly_chart(fig_qq, use_container_width=True)
+    
+        # VaR comparison table
+        st.subheader("VaR Comparison Table")
+        var_table = pd.DataFrame({
+            "Method": ["Historical", "Historical", "Normal", "Normal", "Student-t", "Student-t", "Cornish-Fisher", "Cornish-Fisher"],
+            "Level": ["95%", "99%", "95%", "99%", "95%", "99%", "95%", "99%"],
+            "VaR (1d)": [
+                f"{hist['var_95']:.4f}", f"{hist['var_99']:.4f}",
+                f"{param.get('var_normal_95', 0):.4f}", f"{param.get('var_normal_99', 0):.4f}",
+                f"{param.get('var_t_95', 0):.4f}", f"{param.get('var_t_99', 0):.4f}",
+                f"{cf.get('var_cf_95', 0):.4f}", f"{cf.get('var_cf_99', 0):.4f}",
+            ],
+            "CVaR (1d)": [
+                f"{hist['cvar_95']:.4f}", f"{hist['cvar_99']:.4f}",
+                "—", "—", "—", "—", "—", "—",
+            ],
+        })
+        st.dataframe(var_table, use_container_width=True)
+    
+        t_df = param.get("t_df", np.nan)
+        if not np.isnan(t_df):
+            st.caption(f"Student-t fitted degrees of freedom: **{t_df:.2f}** (lower df = fatter tails; df<5 = extreme fat tails)")
+    
+        # Worst 10 days
+        st.subheader("Worst 10 Trading Days")
+        worst = r.nsmallest(10).reset_index()
+        worst.columns = ["Date", "Return"]
+        worst["Return"] = worst["Return"].map("{:.2%}".format)
+        st.dataframe(worst, use_container_width=True)
+    
+        # ── INTERPRETIVE COMMENTARY ───────────────────────────────────────────────
+        _tail_bullets = []
+        _k_val = simple_r.kurtosis()
+        _s_val = simple_r.skew()
+        _cvar99 = hist["cvar_99"]
+        _var99  = hist["var_99"]
+        _var_cf = cf.get("var_cf_99", _var99)
+        if _k_val > 3:
+            _underest = (_var_cf / _var99 - 1) * 100 if _var99 > 0 else 0
+            _tail_bullets.append(f"Fat tails are **{'extreme' if _k_val > 5 else 'significant'}** (kurtosis {_k_val:.2f}) — standard normal VaR underestimates true tail risk by approximately **{_underest:.0f}%** (Cornish-Fisher correction).")
+        _tail_bullets.append(f"On the worst 1% of trading days, expect losses of **{_cvar99:.2%} or more** (CVaR 99%).")
+        if abs(_s_val) > 0.3:
+            _skew_msg = (f"Return distribution is **right-skewed ({_s_val:.2f})** — occasional large positive outliers offset frequent small losses."
+                         if _s_val > 0 else
+                         f"Return distribution is **left-skewed ({_s_val:.2f})** — large negative returns are more frequent than large positive ones. Downside risk is asymmetric.")
+            _tail_bullets.append(_skew_msg)
+        if _var_cf > _var99 * 1.1:
+            _tail_bullets.append(f"Cornish-Fisher VaR 99% ({_var_cf:.2%}) is materially higher than historical VaR ({_var99:.2%}) — use CF-adjusted estimates for position sizing and risk limits.")
+        _bullet_html = "".join(f"<li style='margin-bottom:4px'>{b}</li>" for b in _tail_bullets)
         st.markdown(
-            f"<div style='background:#1a1a2e;border-left:4px solid #3498db;padding:12px 16px;border-radius:4px;margin-top:8px'>"
-            f"<b style='color:#3498db'>What this means for {_ticker}:</b>"
+            f"<div style='background:#1a1a2e;border-left:4px solid #e74c3c;padding:12px 16px;border-radius:4px;margin-top:8px'>"
+            f"<b style='color:#e74c3c'>What this means for {_ticker}:</b>"
             f"<ul style='margin-top:8px;color:#ddd;font-size:13px'>{_bullet_html}</ul></div>",
             unsafe_allow_html=True,
         )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MARKET RISK — TAIL RISK
-# ══════════════════════════════════════════════════════════════════════════════
-with _mkt_s2:
-    st.subheader("Tail Risk Analysis")
-
-    r = simple_r
-    hist = historical_var_cvar(r)
-    param = parametric_var(r)
-    cf = cornish_fisher_var(r)
-
-    # Return distribution with VaR lines
-    fig_dist = go.Figure()
-    fig_dist.add_trace(go.Histogram(
-        x=r, nbinsx=100, name="Daily Returns",
-        marker_color="#3498db", opacity=0.7,
-        histnorm="probability density",
-    ))
-    # Normal fit overlay
-    xs = np.linspace(r.min(), r.max(), 300)
-    fig_dist.add_trace(go.Scatter(
-        x=xs, y=pd.Series(xs).apply(lambda x: __import__("scipy.stats", fromlist=["norm"]).norm.pdf(x, r.mean(), r.std())),
-        name="Normal Fit", line=dict(color="white", dash="dash"),
-    ))
-    var_lines = [
-        ("VaR 95% Hist", -hist["var_95"], "#f39c12"),
-        ("VaR 99% Hist", -hist["var_99"], "#e74c3c"),
-        ("CVaR 99%", -hist["cvar_99"], "#c0392b"),
-        ("VaR 99% CF", -cf.get("var_cf_99", hist["var_99"]), "#8e44ad"),
-    ]
-    for label, x_val, color in var_lines:
-        fig_dist.add_vline(x=x_val, line_color=color, line_dash="dot", annotation_text=label, annotation_font_color=color)
-    fig_dist.update_layout(title="Return Distribution with VaR/CVaR Overlays", template=DARK, height=400)
-    st.plotly_chart(fig_dist, use_container_width=True)
-
-    # QQ plot
-    from scipy import stats as sp_stats
-    (osm, osr), (slope, intercept, r_val) = sp_stats.probplot(r, dist="norm")
-    fig_qq = go.Figure()
-    fig_qq.add_trace(go.Scatter(x=osm, y=osr, mode="markers", name="Quantiles", marker=dict(color="#3498db", size=3)))
-    fig_qq.add_trace(go.Scatter(
-        x=[min(osm), max(osm)],
-        y=[slope * min(osm) + intercept, slope * max(osm) + intercept],
-        mode="lines", name="Normal line", line=dict(color="white", dash="dash"),
-    ))
-    fig_qq.update_layout(title="QQ Plot vs Normal (fat tails = points above line at extremes)", xaxis_title="Theoretical Quantiles", yaxis_title="Sample Quantiles", template=DARK, height=350)
-    st.plotly_chart(fig_qq, use_container_width=True)
-
-    # VaR comparison table
-    st.subheader("VaR Comparison Table")
-    var_table = pd.DataFrame({
-        "Method": ["Historical", "Historical", "Normal", "Normal", "Student-t", "Student-t", "Cornish-Fisher", "Cornish-Fisher"],
-        "Level": ["95%", "99%", "95%", "99%", "95%", "99%", "95%", "99%"],
-        "VaR (1d)": [
-            f"{hist['var_95']:.4f}", f"{hist['var_99']:.4f}",
-            f"{param.get('var_normal_95', 0):.4f}", f"{param.get('var_normal_99', 0):.4f}",
-            f"{param.get('var_t_95', 0):.4f}", f"{param.get('var_t_99', 0):.4f}",
-            f"{cf.get('var_cf_95', 0):.4f}", f"{cf.get('var_cf_99', 0):.4f}",
-        ],
-        "CVaR (1d)": [
-            f"{hist['cvar_95']:.4f}", f"{hist['cvar_99']:.4f}",
-            "—", "—", "—", "—", "—", "—",
-        ],
-    })
-    st.dataframe(var_table, use_container_width=True)
-
-    t_df = param.get("t_df", np.nan)
-    if not np.isnan(t_df):
-        st.caption(f"Student-t fitted degrees of freedom: **{t_df:.2f}** (lower df = fatter tails; df<5 = extreme fat tails)")
-
-    # Worst 10 days
-    st.subheader("Worst 10 Trading Days")
-    worst = r.nsmallest(10).reset_index()
-    worst.columns = ["Date", "Return"]
-    worst["Return"] = worst["Return"].map("{:.2%}".format)
-    st.dataframe(worst, use_container_width=True)
-
-    # ── INTERPRETIVE COMMENTARY ───────────────────────────────────────────────
-    _tail_bullets = []
-    _k_val = simple_r.kurtosis()
-    _s_val = simple_r.skew()
-    _cvar99 = hist["cvar_99"]
-    _var99  = hist["var_99"]
-    _var_cf = cf.get("var_cf_99", _var99)
-    if _k_val > 3:
-        _underest = (_var_cf / _var99 - 1) * 100 if _var99 > 0 else 0
-        _tail_bullets.append(f"Fat tails are **{'extreme' if _k_val > 5 else 'significant'}** (kurtosis {_k_val:.2f}) — standard normal VaR underestimates true tail risk by approximately **{_underest:.0f}%** (Cornish-Fisher correction).")
-    _tail_bullets.append(f"On the worst 1% of trading days, expect losses of **{_cvar99:.2%} or more** (CVaR 99%).")
-    if abs(_s_val) > 0.3:
-        _skew_msg = (f"Return distribution is **right-skewed ({_s_val:.2f})** — occasional large positive outliers offset frequent small losses."
-                     if _s_val > 0 else
-                     f"Return distribution is **left-skewed ({_s_val:.2f})** — large negative returns are more frequent than large positive ones. Downside risk is asymmetric.")
-        _tail_bullets.append(_skew_msg)
-    if _var_cf > _var99 * 1.1:
-        _tail_bullets.append(f"Cornish-Fisher VaR 99% ({_var_cf:.2%}) is materially higher than historical VaR ({_var99:.2%}) — use CF-adjusted estimates for position sizing and risk limits.")
-    _bullet_html = "".join(f"<li style='margin-bottom:4px'>{b}</li>" for b in _tail_bullets)
-    st.markdown(
-        f"<div style='background:#1a1a2e;border-left:4px solid #e74c3c;padding:12px 16px;border-radius:4px;margin-top:8px'>"
-        f"<b style='color:#e74c3c'>What this means for {_ticker}:</b>"
-        f"<ul style='margin-top:8px;color:#ddd;font-size:13px'>{_bullet_html}</ul></div>",
-        unsafe_allow_html=True,
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # MARKET RISK — RELATIVE RISK
 # ══════════════════════════════════════════════════════════════════════════════
-with _mkt_s3:
-    st.subheader("Relative Risk Analysis")
-
-    beta_spy = rolling_beta(prices, bench_prices)
-    beta_sector = rolling_beta(prices, sector_prices)
-    corr_spy = rolling_correlation(prices, bench_prices)
-    corr_sector = rolling_correlation(prices, sector_prices)
-    idio = residual_vol(prices, bench_prices)
-    sys_vol = rolling_realized_vol(prices, windows=[63])["vol_63d"]
-    ir = information_ratio(prices, sector_prices)
-
-    # Rolling beta
-    fig_beta = go.Figure()
-    fig_beta.add_trace(go.Scatter(x=beta_spy.index, y=beta_spy, name=f"Beta vs {_bench}", line=dict(color="#3498db")))
-    fig_beta.add_trace(go.Scatter(x=beta_sector.index, y=beta_sector, name=f"Beta vs {sector_etf}", line=dict(color="#e74c3c")))
-    fig_beta.add_hline(y=1, line_dash="dot", line_color="white")
-    fig_beta.update_layout(title="Rolling 63d Beta", yaxis_title="Beta", template=DARK, height=350)
-    st.plotly_chart(fig_beta, use_container_width=True)
-
-    # Idio vs systematic decomposition
-    aligned_sys = sys_vol.reindex(idio.index).ffill()
-    fig_decomp = go.Figure()
-    fig_decomp.add_trace(go.Scatter(
-        x=idio.index, y=idio, name="Idiosyncratic Vol",
-        fill="tozeroy", mode="lines", line=dict(color="#e74c3c"),
-        stackgroup="vol",
-    ))
-    fig_decomp.add_trace(go.Scatter(
-        x=aligned_sys.index, y=(aligned_sys - idio).clip(lower=0),
-        name="Systematic Vol",
-        fill="tonexty", mode="lines", line=dict(color="#3498db"),
-        stackgroup="vol",
-    ))
-    fig_decomp.update_layout(
-        title="Idiosyncratic vs Systematic Vol Decomposition (annualized, 63d rolling)",
-        yaxis_title="Annualized Vol", template=DARK, height=350,
-    )
-    st.plotly_chart(fig_decomp, use_container_width=True)
-
-    st.metric(f"Information Ratio vs {sector_etf}", f"{ir:.3f}" if not np.isnan(ir) else "N/A",
-              help="IR > 0.5 = good alpha generation; > 1.0 = excellent")
-
-    # Correlation with sector peers
-    st.subheader("Correlation Heatmap — Sector Peers")
-    with st.spinner("Loading peer data..."):
-        peers = fetch_peers(_ticker, start_date, end_date, top_n=10)
-
-    if peers:
-        all_prices = {_ticker: prices}
-        all_prices.update(peers)
-        price_df = pd.DataFrame(all_prices).dropna()
-        ret_df = price_df.pct_change().dropna()
-        corr_matrix = ret_df.corr()
-
-        fig_heat = go.Figure(go.Heatmap(
-            z=corr_matrix.values,
-            x=corr_matrix.columns.tolist(),
-            y=corr_matrix.index.tolist(),
-            colorscale="RdBu_r",
-            zmin=-1, zmax=1,
-            text=corr_matrix.round(2).values,
-            texttemplate="%{text}",
+if _mkt_s3 is not None:
+    with _mkt_s3:
+        st.subheader("Relative Risk Analysis")
+    
+        beta_spy = rolling_beta(prices, bench_prices)
+        beta_sector = rolling_beta(prices, sector_prices)
+        corr_spy = rolling_correlation(prices, bench_prices)
+        corr_sector = rolling_correlation(prices, sector_prices)
+        idio = residual_vol(prices, bench_prices)
+        sys_vol = rolling_realized_vol(prices, windows=[63])["vol_63d"]
+        ir = information_ratio(prices, sector_prices)
+    
+        # Rolling beta
+        fig_beta = go.Figure()
+        fig_beta.add_trace(go.Scatter(x=beta_spy.index, y=beta_spy, name=f"Beta vs {_bench}", line=dict(color="#3498db")))
+        fig_beta.add_trace(go.Scatter(x=beta_sector.index, y=beta_sector, name=f"Beta vs {sector_etf}", line=dict(color="#e74c3c")))
+        fig_beta.add_hline(y=1, line_dash="dot", line_color="white")
+        fig_beta.update_layout(title="Rolling 63d Beta", yaxis_title="Beta", template=DARK, height=350)
+        st.plotly_chart(fig_beta, use_container_width=True)
+    
+        # Idio vs systematic decomposition
+        aligned_sys = sys_vol.reindex(idio.index).ffill()
+        fig_decomp = go.Figure()
+        fig_decomp.add_trace(go.Scatter(
+            x=idio.index, y=idio, name="Idiosyncratic Vol",
+            fill="tozeroy", mode="lines", line=dict(color="#e74c3c"),
+            stackgroup="vol",
         ))
-        fig_heat.update_layout(title="Correlation Matrix — Sector Peers", template=DARK, height=450)
-        st.plotly_chart(fig_heat, use_container_width=True)
-    else:
-        st.info("Could not load peer data.")
+        fig_decomp.add_trace(go.Scatter(
+            x=aligned_sys.index, y=(aligned_sys - idio).clip(lower=0),
+            name="Systematic Vol",
+            fill="tonexty", mode="lines", line=dict(color="#3498db"),
+            stackgroup="vol",
+        ))
+        fig_decomp.update_layout(
+            title="Idiosyncratic vs Systematic Vol Decomposition (annualized, 63d rolling)",
+            yaxis_title="Annualized Vol", template=DARK, height=350,
+        )
+        st.plotly_chart(fig_decomp, use_container_width=True)
+    
+        st.metric(f"Information Ratio vs {sector_etf}", f"{ir:.3f}" if not np.isnan(ir) else "N/A",
+                  help="IR > 0.5 = good alpha generation; > 1.0 = excellent")
+    
+        # Correlation with sector peers
+        st.subheader("Correlation Heatmap — Sector Peers")
+        with st.spinner("Loading peer data..."):
+            peers = fetch_peers(_ticker, start_date, end_date, top_n=10)
+    
+        if peers:
+            all_prices = {_ticker: prices}
+            all_prices.update(peers)
+            price_df = pd.DataFrame(all_prices).dropna()
+            ret_df = price_df.pct_change().dropna()
+            corr_matrix = ret_df.corr()
+    
+            fig_heat = go.Figure(go.Heatmap(
+                z=corr_matrix.values,
+                x=corr_matrix.columns.tolist(),
+                y=corr_matrix.index.tolist(),
+                colorscale="RdBu_r",
+                zmin=-1, zmax=1,
+                text=corr_matrix.round(2).values,
+                texttemplate="%{text}",
+            ))
+            fig_heat.update_layout(title="Correlation Matrix — Sector Peers", template=DARK, height=450)
+            st.plotly_chart(fig_heat, use_container_width=True)
+        else:
+            st.info("Could not load peer data.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — MACRO & REGIME
+# PAGE 3 — MACRO & REGIME
 # ══════════════════════════════════════════════════════════════════════════════
-with tab3:
+elif _page == "🌍 Macro & Regime":
     st.subheader("Macro Regime Analysis")
 
     if macro_df.empty:
@@ -977,96 +989,97 @@ with tab3:
 # ══════════════════════════════════════════════════════════════════════════════
 # MARKET RISK — BACKTESTER
 # ══════════════════════════════════════════════════════════════════════════════
-with _mkt_s4:
-    _bt_cols = st.columns(3)
-    st.session_state["fast_ma"] = _bt_cols[0].number_input(
-        "Fast MA", min_value=5, max_value=100,
-        value=st.session_state["fast_ma"], step=5)
-    st.session_state["slow_ma"] = _bt_cols[1].number_input(
-        "Slow MA", min_value=10, max_value=300,
-        value=st.session_state["slow_ma"], step=10)
-    _sz_opts = ["vol_target", "kelly", "fixed"]
-    st.session_state["sizing_method"] = _bt_cols[2].selectbox(
-        "Position Sizing", _sz_opts,
-        index=_sz_opts.index(st.session_state["sizing_method"]))
-    fast_ma = st.session_state["fast_ma"]
-    slow_ma = st.session_state["slow_ma"]
-    sizing_method = st.session_state["sizing_method"]
-
-    st.subheader(f"MA Crossover Backtest — {_ticker}")
-    st.caption(f"Strategy: Long when {fast_ma}d MA > {slow_ma}d MA | Sizing: {sizing_method}")
-
-    _bt_key = f"bt_{_ticker}_{fast_ma}_{slow_ma}_{sizing_method}"
-    if _bt_key not in st.session_state:
-        with st.spinner("Running backtest..."):
-            _bt = run_backtest(prices, fast_ma=int(fast_ma), slow_ma=int(slow_ma), sizing=sizing_method)
-            _ci = bootstrap_sharpe_ci(_bt["returns"], n_boot=500)
-            _stress = stress_test(prices, fast_ma=int(fast_ma), slow_ma=int(slow_ma))
-            st.session_state[_bt_key] = (_bt, _ci, _stress)
-    bt, ci, stress = st.session_state[_bt_key]
-
-    s = bt["summary"]
-    bm1, bm2, bm3, bm4, bm5 = st.columns(5)
-    bm1.metric("Total Return", f"{s['total_return']:.2%}")
-    bm2.metric("Ann. Return", f"{s['ann_return']:.2%}")
-    bm3.metric("Sharpe", f"{s['sharpe']:.2f}")
-    bm4.metric("Max Drawdown", f"{s['max_drawdown']:.2%}")
-    bm5.metric("# Trades", s["n_trades"])
-
-    st.caption(f"Sharpe 95% CI (bootstrap, n=1000): [{ci['lower']:.2f}, {ci['upper']:.2f}]")
-
-    # Equity curve with drawdown shading
-    fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3],
-        subplot_titles=["Equity Curve", "Drawdown"])
-
-    fig_bt.add_trace(go.Scatter(
-        x=bt["equity"].index, y=bt["equity"], name="Strategy",
-        line=dict(color="#2ecc71"), fill="tozeroy", fillcolor="rgba(46,204,113,0.05)",
-    ), row=1, col=1)
-
-    # Buy-and-hold reference
-    bah = (1 + simple_r).cumprod()
-    bah_aligned = bah.reindex(bt["equity"].index)
-    fig_bt.add_trace(go.Scatter(
-        x=bah_aligned.index, y=bah_aligned, name="Buy & Hold",
-        line=dict(color="#3498db", dash="dash"),
-    ), row=1, col=1)
-
-    fig_bt.add_trace(go.Scatter(
-        x=bt["drawdown"].index, y=bt["drawdown"],
-        fill="tozeroy", name="Drawdown",
-        line=dict(color="#e74c3c"), fillcolor="rgba(231,76,60,0.3)",
-    ), row=2, col=1)
-
-    fig_bt.update_layout(template=DARK, height=500)
-    st.plotly_chart(fig_bt, use_container_width=True)
-
-    # Rolling Sharpe + Rolling VaR
-    fig_roll = make_subplots(rows=2, cols=1, shared_xaxes=True,
-        subplot_titles=["Rolling 63d Sharpe", "Rolling 63d VaR 95%"])
-    fig_roll.add_trace(go.Scatter(x=bt["rolling_sharpe"].index, y=bt["rolling_sharpe"], name="Rolling Sharpe", line=dict(color="#f39c12")), row=1, col=1)
-    fig_roll.add_hline(y=0, row=1, col=1, line_dash="dot", line_color="white")
-    fig_roll.add_trace(go.Scatter(x=bt["rolling_var95"].index, y=bt["rolling_var95"], name="Rolling VaR 95%", line=dict(color="#e74c3c")), row=2, col=1)
-    fig_roll.update_layout(template=DARK, height=400)
-    st.plotly_chart(fig_roll, use_container_width=True)
-
-    # Stress test
-    st.subheader("Stress Test Results")
-    if not stress.empty:
-        numeric_cols = {"total_return": "{:.2%}", "ann_vol": "{:.2%}", "max_drawdown": "{:.2%}", "sharpe": "{:.2f}"}
-        fmt = {k: v for k, v in numeric_cols.items() if k in stress.columns}
-        gradient_cols = [c for c in ["total_return", "max_drawdown"] if c in stress.columns]
-        styler = stress.style.format(fmt)
-        if gradient_cols:
-            styler = styler.background_gradient(subset=gradient_cols, cmap="RdYlGn")
-        st.dataframe(styler, use_container_width=True)
-    else:
-        st.info("No stress test data available for the selected period.")
+if _mkt_s4 is not None:
+    with _mkt_s4:
+        _bt_cols = st.columns(3)
+        st.session_state["fast_ma"] = _bt_cols[0].number_input(
+            "Fast MA", min_value=5, max_value=100,
+            value=st.session_state["fast_ma"], step=5)
+        st.session_state["slow_ma"] = _bt_cols[1].number_input(
+            "Slow MA", min_value=10, max_value=300,
+            value=st.session_state["slow_ma"], step=10)
+        _sz_opts = ["vol_target", "kelly", "fixed"]
+        st.session_state["sizing_method"] = _bt_cols[2].selectbox(
+            "Position Sizing", _sz_opts,
+            index=_sz_opts.index(st.session_state["sizing_method"]))
+        fast_ma = st.session_state["fast_ma"]
+        slow_ma = st.session_state["slow_ma"]
+        sizing_method = st.session_state["sizing_method"]
+    
+        st.subheader(f"MA Crossover Backtest — {_ticker}")
+        st.caption(f"Strategy: Long when {fast_ma}d MA > {slow_ma}d MA | Sizing: {sizing_method}")
+    
+        _bt_key = f"bt_{_ticker}_{fast_ma}_{slow_ma}_{sizing_method}"
+        if _bt_key not in st.session_state:
+            with st.spinner("Running backtest..."):
+                _bt = run_backtest(prices, fast_ma=int(fast_ma), slow_ma=int(slow_ma), sizing=sizing_method)
+                _ci = bootstrap_sharpe_ci(_bt["returns"], n_boot=500)
+                _stress = stress_test(prices, fast_ma=int(fast_ma), slow_ma=int(slow_ma))
+                st.session_state[_bt_key] = (_bt, _ci, _stress)
+        bt, ci, stress = st.session_state[_bt_key]
+    
+        s = bt["summary"]
+        bm1, bm2, bm3, bm4, bm5 = st.columns(5)
+        bm1.metric("Total Return", f"{s['total_return']:.2%}")
+        bm2.metric("Ann. Return", f"{s['ann_return']:.2%}")
+        bm3.metric("Sharpe", f"{s['sharpe']:.2f}")
+        bm4.metric("Max Drawdown", f"{s['max_drawdown']:.2%}")
+        bm5.metric("# Trades", s["n_trades"])
+    
+        st.caption(f"Sharpe 95% CI (bootstrap, n=1000): [{ci['lower']:.2f}, {ci['upper']:.2f}]")
+    
+        # Equity curve with drawdown shading
+        fig_bt = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3],
+            subplot_titles=["Equity Curve", "Drawdown"])
+    
+        fig_bt.add_trace(go.Scatter(
+            x=bt["equity"].index, y=bt["equity"], name="Strategy",
+            line=dict(color="#2ecc71"), fill="tozeroy", fillcolor="rgba(46,204,113,0.05)",
+        ), row=1, col=1)
+    
+        # Buy-and-hold reference
+        bah = (1 + simple_r).cumprod()
+        bah_aligned = bah.reindex(bt["equity"].index)
+        fig_bt.add_trace(go.Scatter(
+            x=bah_aligned.index, y=bah_aligned, name="Buy & Hold",
+            line=dict(color="#3498db", dash="dash"),
+        ), row=1, col=1)
+    
+        fig_bt.add_trace(go.Scatter(
+            x=bt["drawdown"].index, y=bt["drawdown"],
+            fill="tozeroy", name="Drawdown",
+            line=dict(color="#e74c3c"), fillcolor="rgba(231,76,60,0.3)",
+        ), row=2, col=1)
+    
+        fig_bt.update_layout(template=DARK, height=500)
+        st.plotly_chart(fig_bt, use_container_width=True)
+    
+        # Rolling Sharpe + Rolling VaR
+        fig_roll = make_subplots(rows=2, cols=1, shared_xaxes=True,
+            subplot_titles=["Rolling 63d Sharpe", "Rolling 63d VaR 95%"])
+        fig_roll.add_trace(go.Scatter(x=bt["rolling_sharpe"].index, y=bt["rolling_sharpe"], name="Rolling Sharpe", line=dict(color="#f39c12")), row=1, col=1)
+        fig_roll.add_hline(y=0, row=1, col=1, line_dash="dot", line_color="white")
+        fig_roll.add_trace(go.Scatter(x=bt["rolling_var95"].index, y=bt["rolling_var95"], name="Rolling VaR 95%", line=dict(color="#e74c3c")), row=2, col=1)
+        fig_roll.update_layout(template=DARK, height=400)
+        st.plotly_chart(fig_roll, use_container_width=True)
+    
+        # Stress test
+        st.subheader("Stress Test Results")
+        if not stress.empty:
+            numeric_cols = {"total_return": "{:.2%}", "ann_vol": "{:.2%}", "max_drawdown": "{:.2%}", "sharpe": "{:.2f}"}
+            fmt = {k: v for k, v in numeric_cols.items() if k in stress.columns}
+            gradient_cols = [c for c in ["total_return", "max_drawdown"] if c in stress.columns]
+            styler = stress.style.format(fmt)
+            if gradient_cols:
+                styler = styler.background_gradient(subset=gradient_cols, cmap="RdYlGn")
+            st.dataframe(styler, use_container_width=True)
+        else:
+            st.info("No stress test data available for the selected period.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — FUNDAMENTALS
+# PAGE 5 — FUNDAMENTALS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab5:
+elif _page == "📋 Fundamentals":
     st.subheader(f"Fundamental Risk Analysis — {_ticker}")
 
     _fund_key = f"fund_{_ticker}"
@@ -1404,547 +1417,549 @@ with tab5:
         st.info("No material news found for this ticker.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — SMART MONEY & FACTORS
+# PAGE 4 — SMART MONEY & FACTORS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab4:
+elif _page == "🏛️ Smart Money & Factors":
     _sm_s1, _sm_s2 = st.tabs(["🏛️ Smart Money", "📊 Factor & Shock"])
 
-with _sm_s1:
-    st.subheader(f"Smart Money — SEC EDGAR Data for {_ticker}")
-    st.caption("Form 4 insider transactions · 13F institutional holdings · 13D/13G activist detection · XBRL fundamentals")
-
-    _sm_key = f"smart_money_{_ticker}"
-    if _sm_key not in st.session_state:
-        _sm_progress = st.progress(0, text="Resolving CIK from EDGAR...")
-        try:
-            from data.edgar import resolve_cik as _rcik
-            _cik_val = _rcik(_ticker)
-            _sm_progress.progress(15, text="Fetching Form 4 insider transactions...")
-            _insider_df = fetch_insider_transactions(_ticker, days_back=180)
-            _sm_progress.progress(40, text="Computing insider signals...")
-            _insider_signals = compute_insider_signals(_insider_df)
-            _sm_progress.progress(55, text="Fetching 13F institutional holdings...")
-            _inst_df = fetch_institutional_changes(_ticker)
-            _sm_progress.progress(75, text="Computing institutional signals...")
-            _inst_signals = compute_institutional_signals(_inst_df)
-            _sm_progress.progress(85, text="Checking 13D/13G activist filings...")
-            _activist_df = fetch_activist_positions(_ticker)
-            _sm_progress.progress(95, text="Fetching XBRL fundamentals...")
-            _xbrl = fetch_xbrl_fundamentals(_ticker)
-            _sm_progress.progress(100, text="Done.")
-            _sm_progress.empty()
-            st.session_state[_sm_key] = (_cik_val, _insider_df, _insider_signals,
-                                          _inst_df, _inst_signals, _activist_df, _xbrl)
-        except Exception as _e:
-            _sm_progress.empty()
-            st.error(f"EDGAR data load failed: {_e}")
-            st.session_state[_sm_key] = ("ERROR", None, {}, None, {}, None, {})
-
-    (_cik_val, _insider_df, _insider_signals,
-     _inst_df, _inst_signals, _activist_df, _xbrl) = st.session_state[_sm_key]
-
-    if not _cik_val or _cik_val == "ERROR":
-        st.warning(f"EDGAR data unavailable for {_ticker}. CIK could not be resolved.")
-        _cik_val = None
-        _insider_df = pd.DataFrame()
-        _insider_signals = {}
-        _inst_df = pd.DataFrame()
-        _inst_signals = {"n_adding": 0, "n_reducing": 0, "n_new": 0, "n_closed": 0, "signal": "NEUTRAL"}
-        _activist_df = pd.DataFrame()
-        _xbrl = {"source": "unavailable"}
-    else:
-        st.caption(f"CIK: {_cik_val}  |  Data source: SEC EDGAR (free API)")
-
-    # ── SECTION 1: INSIDER ACTIVITY ──────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("📊 Section 1: Insider Activity (Form 4)")
-
-    # Cluster alert banner
-    _cluster = _insider_signals.get("cluster_signal")
-    _cluster_names = _insider_signals.get("cluster_insiders", [])
-    if _cluster == "BUY":
-        st.markdown(
-            f"<div style='background:#2ecc7122;border-left:5px solid #2ecc71;padding:12px 18px;border-radius:6px;margin-bottom:12px'>"
-            f"<b style='color:#2ecc71;font-size:16px'>🟢 INSIDER BUYING CLUSTER</b><br>"
-            f"<span style='color:#ccc'>{len(_cluster_names)} insiders bought in the last 30 days: {', '.join(_cluster_names[:5])}</span>"
-            f"</div>", unsafe_allow_html=True)
-    elif _cluster == "SELL":
-        st.markdown(
-            f"<div style='background:#e74c3c22;border-left:5px solid #e74c3c;padding:12px 18px;border-radius:6px;margin-bottom:12px'>"
-            f"<b style='color:#e74c3c;font-size:16px'>🔴 INSIDER SELLING CLUSTER</b><br>"
-            f"<span style='color:#ccc'>{len(_cluster_names)} insiders sold in the last 30 days: {', '.join(_cluster_names[:5])}</span>"
-            f"</div>", unsafe_allow_html=True)
-    else:
-        st.info("🟡 No insider cluster signal detected in the last 30 days.")
-
-    # Summary metrics
-    _si = _insider_signals
-    _ic1, _ic2, _ic3, _ic4 = st.columns(4)
-    def _fmt_dollars(v):
-        if v == 0 or np.isnan(v): return "$0"
-        sign = "+" if v > 0 else ""
-        if abs(v) >= 1e6: return f"{sign}${abs(v)/1e6:.1f}M"
-        if abs(v) >= 1e3: return f"{sign}${abs(v)/1e3:.0f}K"
-        return f"{sign}${abs(v):.0f}"
-    _ic1.metric("Net Insider Flow (30d)", _fmt_dollars(_si["net_30d"]),
-                help="Positive = net buying, negative = net selling (open market only)")
-    _ic2.metric("Net Insider Flow (90d)", _fmt_dollars(_si["net_90d"]))
-    _bsr = _si.get("buy_sell_ratio_90d", np.nan)
-    _ic3.metric("Buy/Sell Ratio (90d)", f"{_bsr:.2f}" if not np.isnan(_bsr) else "N/A",
-                help=">0.6 = bullish signal; <0.4 = bearish")
-    _ic4.metric("Weighted Net (CEO/CFO 2×)", _fmt_dollars(_si["weighted_net_90d"]))
-
-    if not _insider_df.empty:
-        # Price chart with insider transactions overlaid
-        _fig_ins = go.Figure()
-        _fig_ins.add_trace(go.Scatter(
-            x=prices.index, y=prices,
-            name="Price", line=dict(color="#3498db", width=1.5),
-        ))
-
-        _ins_plot = _insider_df.copy()
-        _ins_plot["date"] = pd.to_datetime(_ins_plot["date"], errors="coerce")
-        _ins_plot = _ins_plot.dropna(subset=["date"])
-        _ins_plot = _ins_plot[(_ins_plot["date"] >= prices.index[0]) & (_ins_plot["date"] <= prices.index[-1])]
-
-        if not _ins_plot.empty:
-            # Map transaction dates to nearest price dates
-            _ins_plot["price_at_date"] = _ins_plot["date"].apply(
-                lambda d: float(prices.reindex([d], method="nearest").iloc[0]) if len(prices) > 0 else np.nan
-            )
-
-            _buys_plt = _ins_plot[_ins_plot["is_buy"]]
-            _sells_plt = _ins_plot[~_ins_plot["is_buy"]]
-
-            max_dv = _ins_plot["dollar_value"].max() if not _ins_plot.empty else 1
-            _size_scale = lambda dv: max(8, min(30, int(dv / max_dv * 25) + 8))
-
-            if not _buys_plt.empty:
-                _fig_ins.add_trace(go.Scatter(
-                    x=_buys_plt["date"],
-                    y=_buys_plt["price_at_date"],
-                    mode="markers",
-                    marker=dict(
-                        symbol="triangle-up",
-                        color="#2ecc71",
-                        size=[_size_scale(v) for v in _buys_plt["dollar_value"]],
-                        line=dict(color="white", width=1),
-                    ),
-                    name="Insider Buy",
-                    text=[f"{r['name']} ({r['title']})<br>${r['dollar_value']:,.0f} ({r['shares']:,.0f} sh @ ${r['price']:.2f})"
-                          for _, r in _buys_plt.iterrows()],
-                    hovertemplate="%{text}<extra></extra>",
-                ))
-            if not _sells_plt.empty:
-                _fig_ins.add_trace(go.Scatter(
-                    x=_sells_plt["date"],
-                    y=_sells_plt["price_at_date"],
-                    mode="markers",
-                    marker=dict(
-                        symbol="triangle-down",
-                        color="#e74c3c",
-                        size=[_size_scale(v) for v in _sells_plt["dollar_value"]],
-                        line=dict(color="white", width=1),
-                    ),
-                    name="Insider Sale",
-                    text=[f"{r['name']} ({r['title']})<br>${r['dollar_value']:,.0f} ({r['shares']:,.0f} sh @ ${r['price']:.2f})"
-                          for _, r in _sells_plt.iterrows()],
-                    hovertemplate="%{text}<extra></extra>",
-                ))
-
-        _fig_ins.update_layout(
-            title=f"{_ticker} Price with Insider Transactions (▲ Buy / ▼ Sell, size = $ value)",
-            yaxis_title="Price ($)", template=DARK, height=400,
-            xaxis_rangeslider_visible=False,
-        )
-        st.plotly_chart(_fig_ins, use_container_width=True)
-
-        # Transactions table
-        st.subheader("Recent Insider Transactions (last 180 days)")
-        _show_df = _insider_df.head(30).copy()
-        _show_df["dollar_value"] = _show_df["dollar_value"].apply(lambda v: f"${v:,.0f}" if pd.notna(v) else "N/A")
-        _show_df["conviction_pct"] = _show_df["conviction_pct"].apply(lambda v: f"{v:.1f}%" if pd.notna(v) and not np.isnan(v) else "N/A")
-        _show_df["type_label"] = _show_df["is_buy"].map({True: "🟢 BUY", False: "🔴 SELL"})
-        _display_cols = ["date", "name", "title", "type_label", "shares", "price", "dollar_value", "conviction_pct"]
-        _avail_cols = [c for c in _display_cols if c in _show_df.columns]
-        st.dataframe(_show_df[_avail_cols].rename(columns={
-            "type_label": "Type", "conviction_pct": "Conviction",
-            "dollar_value": "$ Value",
-        }), use_container_width=True, hide_index=True)
-    else:
-        st.info(f"No open-market insider transactions found for {_ticker} in the last 180 days via EDGAR.")
-
-    # ── SECTION 2: INSTITUTIONAL / HEDGE FUND HOLDINGS ───────────────────────
-    st.markdown("---")
-    st.subheader("🏦 Section 2: Institutional Holdings (13F)")
-
-    _inst_sig = _inst_signals
-    _is1, _is2, _is3, _is4 = st.columns(4)
-    _is1.metric("Funds Adding", _inst_sig["n_adding"], help="# funds that increased position this quarter")
-    _is2.metric("Funds Reducing", _inst_sig["n_reducing"])
-    _is3.metric("New Positions", _inst_sig["n_new"], help="Funds that initiated a new position (most bullish)")
-    _is4.metric("Closed Positions", _inst_sig["n_closed"], help="Funds that fully exited (most bearish)")
-
-    _inst_color = "#2ecc71" if _inst_sig["signal"] == "ACCUMULATION" else "#e74c3c" if _inst_sig["signal"] == "DISTRIBUTION" else "#95a5a6"
-    st.markdown(
-        f"<div style='background:{_inst_color}22;border-left:4px solid {_inst_color};padding:10px 16px;border-radius:4px;margin:8px 0'>"
-        f"<b style='color:{_inst_color}'>Institutional Signal: {_inst_sig['signal']}</b>"
-        f"</div>", unsafe_allow_html=True)
-
-    if not _inst_df.empty:
-        # Color-coded change table
-        _inst_display = _inst_df.copy()
-        _inst_display["change_pct_fmt"] = _inst_display["change_pct"].apply(
-            lambda v: f"{v:+.1f}%" if pd.notna(v) else "NEW" if True else "N/A"
-        )
-        for _, row in _inst_df.iterrows():
-            if row["signal"] == "NEW":
-                _inst_display.loc[_, "change_pct_fmt"] = "NEW ★"
-            elif row["signal"] == "CLOSED":
-                _inst_display.loc[_, "change_pct_fmt"] = "CLOSED ✗"
-
-        _inst_display["curr_value_fmt"] = _inst_display["curr_value"].apply(
-            lambda v: f"${v/1e6:.1f}M" if pd.notna(v) and v > 0 else "—"
-        )
-        _inst_display["change_shares_fmt"] = _inst_display["change_shares"].apply(
-            lambda v: f"{v:+,.0f}" if pd.notna(v) else "N/A"
-        )
-        st.dataframe(
-            _inst_display[["fund_name", "date_reported", "curr_shares", "change_shares_fmt",
-                           "change_pct_fmt", "curr_value_fmt", "signal"]].rename(columns={
-                "fund_name": "Fund", "date_reported": "Filed",
-                "curr_shares": "Current Shares", "change_shares_fmt": "Change",
-                "change_pct_fmt": "Change %", "curr_value_fmt": "Market Value",
-                "signal": "Signal",
-            }),
-            use_container_width=True, hide_index=True,
-        )
-    else:
-        st.info("Limited institutional 13F data available for this ticker. Large funds may not hold this position.")
-
-    # ── SECTION 3: ACTIVIST WATCH ─────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("🎯 Section 3: Activist Watch (13D/13G)")
-
-    if not _activist_df.empty:
-        latest_activist = _activist_df.iloc[0]
-        _a_color = "#e74c3c" if latest_activist["activist_intent"] else "#f39c12"
-        _a_type = "ACTIVIST (13D — control/influence intent)" if latest_activist["activist_intent"] else "PASSIVE (13G — investment only)"
-        st.markdown(
-            f"<div style='background:{_a_color}33;border:2px solid {_a_color};border-radius:8px;padding:16px;margin-bottom:12px'>"
-            f"<div style='font-size:18px;font-weight:bold;color:{_a_color}'>⚡ ACTIVIST POSITION DETECTED</div>"
-            f"<div style='margin-top:8px;color:#ddd'>"
-            f"<b>{latest_activist['filer_name']}</b> — {_a_type}<br>"
-            f"Ownership: <b>{'%.1f%%' % latest_activist['ownership_pct'] if pd.notna(latest_activist['ownership_pct']) else 'See filing'}</b> | "
-            f"Filed: {latest_activist['filing_date']}"
-            f"</div></div>",
-            unsafe_allow_html=True,
-        )
-        st.dataframe(
-            _activist_df[["filer_name", "form_type", "filing_date", "ownership_pct", "amendment", "activist_intent"]].rename(columns={
-                "filer_name": "Filer", "form_type": "Form", "filing_date": "Filed",
-                "ownership_pct": "% Owned", "amendment": "Amendment", "activist_intent": "Activist (13D)",
-            }),
-            use_container_width=True, hide_index=True,
-        )
-    else:
-        st.success(f"No activist positions detected for {_ticker} (threshold: >5% ownership via 13D/13G filing).")
-
-    # ── SECTION 4: XBRL FUNDAMENTALS VS YFINANCE ─────────────────────────────
-    st.markdown("---")
-    st.subheader("📑 Section 4: EDGAR XBRL Fundamentals")
-
-    if _xbrl.get("source") == "unavailable":
-        st.warning(f"XBRL data unavailable for {_ticker}.")
-    else:
-        _xc1, _xc2, _xc3 = st.columns(3)
-        def _b(v, label, col):
-            formatted = f"${v/1e9:.2f}B" if not np.isnan(v) and abs(v) >= 1e9 else f"${v/1e6:.0f}M" if not np.isnan(v) else "N/A"
-            col.metric(label, formatted, help="Source: EDGAR XBRL 10-K")
-
-        _b(_xbrl.get("latest_revenue", np.nan), "Revenue (XBRL)", _xc1)
-        _b(_xbrl.get("latest_net_income", np.nan), "Net Income (XBRL)", _xc2)
-        _b(_xbrl.get("latest_fcf", np.nan), "FCF (XBRL)", _xc3)
-
-        _xc4, _xc5, _xc6 = st.columns(3)
-        _b(_xbrl.get("latest_total_assets", np.nan), "Total Assets", _xc4)
-        _b(_xbrl.get("net_debt", np.nan), "Net Debt", _xc5)
-        _ic = _xbrl.get("interest_coverage", np.nan)
-        _xc6.metric("Interest Coverage", f"{_ic:.1f}×" if not np.isnan(_ic) else "N/A")
-
-        # FCF time series from XBRL
-        _fcf_s = _xbrl.get("fcf_series", pd.Series(dtype=float))
-        if not _fcf_s.empty:
-            st.subheader("FCF Trend (from EDGAR XBRL 10-K filings)")
-            _fig_xfcf = go.Figure(go.Bar(
-                x=[str(d)[:4] for d in _fcf_s.index],
-                y=(_fcf_s / 1e9).round(3),
-                marker_color=["#2ecc71" if v >= 0 else "#e74c3c" for v in _fcf_s],
-                name="FCF ($B)",
-                text=[f"${v/1e9:.2f}B" for v in _fcf_s],
-                textposition="outside",
-            ))
-            _fig_xfcf.update_layout(
-                title=f"{_ticker} Free Cash Flow (EDGAR XBRL)",
-                yaxis_title="FCF ($B)", template=DARK, height=300,
-            )
-            st.plotly_chart(_fig_xfcf, use_container_width=True)
-
-        # Accruals ratio
-        _acc = _xbrl.get("accruals_ratio", np.nan)
-        if not np.isnan(_acc):
-            _acc_c = "#e74c3c" if abs(_acc) > 0.05 else "#2ecc71"
+if _sm_s1 is not None:
+    with _sm_s1:
+        st.subheader(f"Smart Money — SEC EDGAR Data for {_ticker}")
+        st.caption("Form 4 insider transactions · 13F institutional holdings · 13D/13G activist detection · XBRL fundamentals")
+    
+        _sm_key = f"smart_money_{_ticker}"
+        if _sm_key not in st.session_state:
+            _sm_progress = st.progress(0, text="Resolving CIK from EDGAR...")
+            try:
+                from data.edgar import resolve_cik as _rcik
+                _cik_val = _rcik(_ticker)
+                _sm_progress.progress(15, text="Fetching Form 4 insider transactions...")
+                _insider_df = fetch_insider_transactions(_ticker, days_back=180)
+                _sm_progress.progress(40, text="Computing insider signals...")
+                _insider_signals = compute_insider_signals(_insider_df)
+                _sm_progress.progress(55, text="Fetching 13F institutional holdings...")
+                _inst_df = fetch_institutional_changes(_ticker)
+                _sm_progress.progress(75, text="Computing institutional signals...")
+                _inst_signals = compute_institutional_signals(_inst_df)
+                _sm_progress.progress(85, text="Checking 13D/13G activist filings...")
+                _activist_df = fetch_activist_positions(_ticker)
+                _sm_progress.progress(95, text="Fetching XBRL fundamentals...")
+                _xbrl = fetch_xbrl_fundamentals(_ticker)
+                _sm_progress.progress(100, text="Done.")
+                _sm_progress.empty()
+                st.session_state[_sm_key] = (_cik_val, _insider_df, _insider_signals,
+                                              _inst_df, _inst_signals, _activist_df, _xbrl)
+            except Exception as _e:
+                _sm_progress.empty()
+                st.error(f"EDGAR data load failed: {_e}")
+                st.session_state[_sm_key] = ("ERROR", None, {}, None, {}, None, {})
+    
+        (_cik_val, _insider_df, _insider_signals,
+         _inst_df, _inst_signals, _activist_df, _xbrl) = st.session_state[_sm_key]
+    
+        if not _cik_val or _cik_val == "ERROR":
+            st.warning(f"EDGAR data unavailable for {_ticker}. CIK could not be resolved.")
+            _cik_val = None
+            _insider_df = pd.DataFrame()
+            _insider_signals = {}
+            _inst_df = pd.DataFrame()
+            _inst_signals = {"n_adding": 0, "n_reducing": 0, "n_new": 0, "n_closed": 0, "signal": "NEUTRAL"}
+            _activist_df = pd.DataFrame()
+            _xbrl = {"source": "unavailable"}
+        else:
+            st.caption(f"CIK: {_cik_val}  |  Data source: SEC EDGAR (free API)")
+    
+        # ── SECTION 1: INSIDER ACTIVITY ──────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("📊 Section 1: Insider Activity (Form 4)")
+    
+        # Cluster alert banner
+        _cluster = _insider_signals.get("cluster_signal")
+        _cluster_names = _insider_signals.get("cluster_insiders", [])
+        if _cluster == "BUY":
             st.markdown(
-                f"<div style='background:{_acc_c}22;border-left:3px solid {_acc_c};padding:8px 14px;border-radius:4px'>"
-                f"<b style='color:{_acc_c}'>Accruals Ratio (EDGAR): {_acc:.2%}</b> — "
-                f"{'⚠️ High accruals (>5%): earnings quality concern' if abs(_acc) > 0.05 else '✓ Normal earnings quality'}"
+                f"<div style='background:#2ecc7122;border-left:5px solid #2ecc71;padding:12px 18px;border-radius:6px;margin-bottom:12px'>"
+                f"<b style='color:#2ecc71;font-size:16px'>🟢 INSIDER BUYING CLUSTER</b><br>"
+                f"<span style='color:#ccc'>{len(_cluster_names)} insiders bought in the last 30 days: {', '.join(_cluster_names[:5])}</span>"
                 f"</div>", unsafe_allow_html=True)
-
-        st.caption("Source: EDGAR XBRL (10-K filings). All values in USD.")
+        elif _cluster == "SELL":
+            st.markdown(
+                f"<div style='background:#e74c3c22;border-left:5px solid #e74c3c;padding:12px 18px;border-radius:6px;margin-bottom:12px'>"
+                f"<b style='color:#e74c3c;font-size:16px'>🔴 INSIDER SELLING CLUSTER</b><br>"
+                f"<span style='color:#ccc'>{len(_cluster_names)} insiders sold in the last 30 days: {', '.join(_cluster_names[:5])}</span>"
+                f"</div>", unsafe_allow_html=True)
+        else:
+            st.info("🟡 No insider cluster signal detected in the last 30 days.")
+    
+        # Summary metrics
+        _si = _insider_signals
+        _ic1, _ic2, _ic3, _ic4 = st.columns(4)
+        def _fmt_dollars(v):
+            if v == 0 or np.isnan(v): return "$0"
+            sign = "+" if v > 0 else ""
+            if abs(v) >= 1e6: return f"{sign}${abs(v)/1e6:.1f}M"
+            if abs(v) >= 1e3: return f"{sign}${abs(v)/1e3:.0f}K"
+            return f"{sign}${abs(v):.0f}"
+        _ic1.metric("Net Insider Flow (30d)", _fmt_dollars(_si["net_30d"]),
+                    help="Positive = net buying, negative = net selling (open market only)")
+        _ic2.metric("Net Insider Flow (90d)", _fmt_dollars(_si["net_90d"]))
+        _bsr = _si.get("buy_sell_ratio_90d", np.nan)
+        _ic3.metric("Buy/Sell Ratio (90d)", f"{_bsr:.2f}" if not np.isnan(_bsr) else "N/A",
+                    help=">0.6 = bullish signal; <0.4 = bearish")
+        _ic4.metric("Weighted Net (CEO/CFO 2×)", _fmt_dollars(_si["weighted_net_90d"]))
+    
+        if not _insider_df.empty:
+            # Price chart with insider transactions overlaid
+            _fig_ins = go.Figure()
+            _fig_ins.add_trace(go.Scatter(
+                x=prices.index, y=prices,
+                name="Price", line=dict(color="#3498db", width=1.5),
+            ))
+    
+            _ins_plot = _insider_df.copy()
+            _ins_plot["date"] = pd.to_datetime(_ins_plot["date"], errors="coerce")
+            _ins_plot = _ins_plot.dropna(subset=["date"])
+            _ins_plot = _ins_plot[(_ins_plot["date"] >= prices.index[0]) & (_ins_plot["date"] <= prices.index[-1])]
+    
+            if not _ins_plot.empty:
+                # Map transaction dates to nearest price dates
+                _ins_plot["price_at_date"] = _ins_plot["date"].apply(
+                    lambda d: float(prices.reindex([d], method="nearest").iloc[0]) if len(prices) > 0 else np.nan
+                )
+    
+                _buys_plt = _ins_plot[_ins_plot["is_buy"]]
+                _sells_plt = _ins_plot[~_ins_plot["is_buy"]]
+    
+                max_dv = _ins_plot["dollar_value"].max() if not _ins_plot.empty else 1
+                _size_scale = lambda dv: max(8, min(30, int(dv / max_dv * 25) + 8))
+    
+                if not _buys_plt.empty:
+                    _fig_ins.add_trace(go.Scatter(
+                        x=_buys_plt["date"],
+                        y=_buys_plt["price_at_date"],
+                        mode="markers",
+                        marker=dict(
+                            symbol="triangle-up",
+                            color="#2ecc71",
+                            size=[_size_scale(v) for v in _buys_plt["dollar_value"]],
+                            line=dict(color="white", width=1),
+                        ),
+                        name="Insider Buy",
+                        text=[f"{r['name']} ({r['title']})<br>${r['dollar_value']:,.0f} ({r['shares']:,.0f} sh @ ${r['price']:.2f})"
+                              for _, r in _buys_plt.iterrows()],
+                        hovertemplate="%{text}<extra></extra>",
+                    ))
+                if not _sells_plt.empty:
+                    _fig_ins.add_trace(go.Scatter(
+                        x=_sells_plt["date"],
+                        y=_sells_plt["price_at_date"],
+                        mode="markers",
+                        marker=dict(
+                            symbol="triangle-down",
+                            color="#e74c3c",
+                            size=[_size_scale(v) for v in _sells_plt["dollar_value"]],
+                            line=dict(color="white", width=1),
+                        ),
+                        name="Insider Sale",
+                        text=[f"{r['name']} ({r['title']})<br>${r['dollar_value']:,.0f} ({r['shares']:,.0f} sh @ ${r['price']:.2f})"
+                              for _, r in _sells_plt.iterrows()],
+                        hovertemplate="%{text}<extra></extra>",
+                    ))
+    
+            _fig_ins.update_layout(
+                title=f"{_ticker} Price with Insider Transactions (▲ Buy / ▼ Sell, size = $ value)",
+                yaxis_title="Price ($)", template=DARK, height=400,
+                xaxis_rangeslider_visible=False,
+            )
+            st.plotly_chart(_fig_ins, use_container_width=True)
+    
+            # Transactions table
+            st.subheader("Recent Insider Transactions (last 180 days)")
+            _show_df = _insider_df.head(30).copy()
+            _show_df["dollar_value"] = _show_df["dollar_value"].apply(lambda v: f"${v:,.0f}" if pd.notna(v) else "N/A")
+            _show_df["conviction_pct"] = _show_df["conviction_pct"].apply(lambda v: f"{v:.1f}%" if pd.notna(v) and not np.isnan(v) else "N/A")
+            _show_df["type_label"] = _show_df["is_buy"].map({True: "🟢 BUY", False: "🔴 SELL"})
+            _display_cols = ["date", "name", "title", "type_label", "shares", "price", "dollar_value", "conviction_pct"]
+            _avail_cols = [c for c in _display_cols if c in _show_df.columns]
+            st.dataframe(_show_df[_avail_cols].rename(columns={
+                "type_label": "Type", "conviction_pct": "Conviction",
+                "dollar_value": "$ Value",
+            }), use_container_width=True, hide_index=True)
+        else:
+            st.info(f"No open-market insider transactions found for {_ticker} in the last 180 days via EDGAR.")
+    
+        # ── SECTION 2: INSTITUTIONAL / HEDGE FUND HOLDINGS ───────────────────────
+        st.markdown("---")
+        st.subheader("🏦 Section 2: Institutional Holdings (13F)")
+    
+        _inst_sig = _inst_signals
+        _is1, _is2, _is3, _is4 = st.columns(4)
+        _is1.metric("Funds Adding", _inst_sig["n_adding"], help="# funds that increased position this quarter")
+        _is2.metric("Funds Reducing", _inst_sig["n_reducing"])
+        _is3.metric("New Positions", _inst_sig["n_new"], help="Funds that initiated a new position (most bullish)")
+        _is4.metric("Closed Positions", _inst_sig["n_closed"], help="Funds that fully exited (most bearish)")
+    
+        _inst_color = "#2ecc71" if _inst_sig["signal"] == "ACCUMULATION" else "#e74c3c" if _inst_sig["signal"] == "DISTRIBUTION" else "#95a5a6"
+        st.markdown(
+            f"<div style='background:{_inst_color}22;border-left:4px solid {_inst_color};padding:10px 16px;border-radius:4px;margin:8px 0'>"
+            f"<b style='color:{_inst_color}'>Institutional Signal: {_inst_sig['signal']}</b>"
+            f"</div>", unsafe_allow_html=True)
+    
+        if not _inst_df.empty:
+            # Color-coded change table
+            _inst_display = _inst_df.copy()
+            _inst_display["change_pct_fmt"] = _inst_display["change_pct"].apply(
+                lambda v: f"{v:+.1f}%" if pd.notna(v) else "NEW" if True else "N/A"
+            )
+            for _, row in _inst_df.iterrows():
+                if row["signal"] == "NEW":
+                    _inst_display.loc[_, "change_pct_fmt"] = "NEW ★"
+                elif row["signal"] == "CLOSED":
+                    _inst_display.loc[_, "change_pct_fmt"] = "CLOSED ✗"
+    
+            _inst_display["curr_value_fmt"] = _inst_display["curr_value"].apply(
+                lambda v: f"${v/1e6:.1f}M" if pd.notna(v) and v > 0 else "—"
+            )
+            _inst_display["change_shares_fmt"] = _inst_display["change_shares"].apply(
+                lambda v: f"{v:+,.0f}" if pd.notna(v) else "N/A"
+            )
+            st.dataframe(
+                _inst_display[["fund_name", "date_reported", "curr_shares", "change_shares_fmt",
+                               "change_pct_fmt", "curr_value_fmt", "signal"]].rename(columns={
+                    "fund_name": "Fund", "date_reported": "Filed",
+                    "curr_shares": "Current Shares", "change_shares_fmt": "Change",
+                    "change_pct_fmt": "Change %", "curr_value_fmt": "Market Value",
+                    "signal": "Signal",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("Limited institutional 13F data available for this ticker. Large funds may not hold this position.")
+    
+        # ── SECTION 3: ACTIVIST WATCH ─────────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("🎯 Section 3: Activist Watch (13D/13G)")
+    
+        if not _activist_df.empty:
+            latest_activist = _activist_df.iloc[0]
+            _a_color = "#e74c3c" if latest_activist["activist_intent"] else "#f39c12"
+            _a_type = "ACTIVIST (13D — control/influence intent)" if latest_activist["activist_intent"] else "PASSIVE (13G — investment only)"
+            st.markdown(
+                f"<div style='background:{_a_color}33;border:2px solid {_a_color};border-radius:8px;padding:16px;margin-bottom:12px'>"
+                f"<div style='font-size:18px;font-weight:bold;color:{_a_color}'>⚡ ACTIVIST POSITION DETECTED</div>"
+                f"<div style='margin-top:8px;color:#ddd'>"
+                f"<b>{latest_activist['filer_name']}</b> — {_a_type}<br>"
+                f"Ownership: <b>{'%.1f%%' % latest_activist['ownership_pct'] if pd.notna(latest_activist['ownership_pct']) else 'See filing'}</b> | "
+                f"Filed: {latest_activist['filing_date']}"
+                f"</div></div>",
+                unsafe_allow_html=True,
+            )
+            st.dataframe(
+                _activist_df[["filer_name", "form_type", "filing_date", "ownership_pct", "amendment", "activist_intent"]].rename(columns={
+                    "filer_name": "Filer", "form_type": "Form", "filing_date": "Filed",
+                    "ownership_pct": "% Owned", "amendment": "Amendment", "activist_intent": "Activist (13D)",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.success(f"No activist positions detected for {_ticker} (threshold: >5% ownership via 13D/13G filing).")
+    
+        # ── SECTION 4: XBRL FUNDAMENTALS VS YFINANCE ─────────────────────────────
+        st.markdown("---")
+        st.subheader("📑 Section 4: EDGAR XBRL Fundamentals")
+    
+        if _xbrl.get("source") == "unavailable":
+            st.warning(f"XBRL data unavailable for {_ticker}.")
+        else:
+            _xc1, _xc2, _xc3 = st.columns(3)
+            def _b(v, label, col):
+                formatted = f"${v/1e9:.2f}B" if not np.isnan(v) and abs(v) >= 1e9 else f"${v/1e6:.0f}M" if not np.isnan(v) else "N/A"
+                col.metric(label, formatted, help="Source: EDGAR XBRL 10-K")
+    
+            _b(_xbrl.get("latest_revenue", np.nan), "Revenue (XBRL)", _xc1)
+            _b(_xbrl.get("latest_net_income", np.nan), "Net Income (XBRL)", _xc2)
+            _b(_xbrl.get("latest_fcf", np.nan), "FCF (XBRL)", _xc3)
+    
+            _xc4, _xc5, _xc6 = st.columns(3)
+            _b(_xbrl.get("latest_total_assets", np.nan), "Total Assets", _xc4)
+            _b(_xbrl.get("net_debt", np.nan), "Net Debt", _xc5)
+            _ic = _xbrl.get("interest_coverage", np.nan)
+            _xc6.metric("Interest Coverage", f"{_ic:.1f}×" if not np.isnan(_ic) else "N/A")
+    
+            # FCF time series from XBRL
+            _fcf_s = _xbrl.get("fcf_series", pd.Series(dtype=float))
+            if not _fcf_s.empty:
+                st.subheader("FCF Trend (from EDGAR XBRL 10-K filings)")
+                _fig_xfcf = go.Figure(go.Bar(
+                    x=[str(d)[:4] for d in _fcf_s.index],
+                    y=(_fcf_s / 1e9).round(3),
+                    marker_color=["#2ecc71" if v >= 0 else "#e74c3c" for v in _fcf_s],
+                    name="FCF ($B)",
+                    text=[f"${v/1e9:.2f}B" for v in _fcf_s],
+                    textposition="outside",
+                ))
+                _fig_xfcf.update_layout(
+                    title=f"{_ticker} Free Cash Flow (EDGAR XBRL)",
+                    yaxis_title="FCF ($B)", template=DARK, height=300,
+                )
+                st.plotly_chart(_fig_xfcf, use_container_width=True)
+    
+            # Accruals ratio
+            _acc = _xbrl.get("accruals_ratio", np.nan)
+            if not np.isnan(_acc):
+                _acc_c = "#e74c3c" if abs(_acc) > 0.05 else "#2ecc71"
+                st.markdown(
+                    f"<div style='background:{_acc_c}22;border-left:3px solid {_acc_c};padding:8px 14px;border-radius:4px'>"
+                    f"<b style='color:{_acc_c}'>Accruals Ratio (EDGAR): {_acc:.2%}</b> — "
+                    f"{'⚠️ High accruals (>5%): earnings quality concern' if abs(_acc) > 0.05 else '✓ Normal earnings quality'}"
+                    f"</div>", unsafe_allow_html=True)
+    
+            st.caption("Source: EDGAR XBRL (10-K filings). All values in USD.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SMART MONEY & FACTORS — FACTOR & SHOCK ANALYSIS
 # ══════════════════════════════════════════════════════════════════════════════
-with _sm_s2:
-    st.subheader(f"Factor & Shock Analysis — {_ticker}")
-
-    _factor_key = f"factor_{_ticker}"
-    _shock_key = f"shock_{_ticker}"
-
-    if _factor_key not in st.session_state:
-        with st.spinner("Running Fama-French factor decomposition..."):
-            try:
-                _fd = factor_decomposition(prices, start_date, end_date)
-            except Exception as _fe:
-                _fd = {"available": False, "error": str(_fe)}
-        st.session_state[_factor_key] = _fd
-    if _shock_key not in st.session_state:
-        with st.spinner("Analyzing sector-specific price shocks..."):
-            try:
-                _sd = analyze_price_shock(_ticker, info.get("sector", "Unknown"), prices, start_date, end_date)
-            except Exception as _se:
-                _sd = {"available": False, "error": str(_se)}
-        st.session_state[_shock_key] = _sd
-
-    _fd = st.session_state[_factor_key]
-    _sd = st.session_state[_shock_key]
-
-    # ── SECTION 1: FAMA-FRENCH DECOMPOSITION ─────────────────────────────────
-    st.markdown("---")
-    st.subheader("🔬 Section 1: Fama-French 5-Factor + Momentum Decomposition")
-
-    if not _fd.get("available", False):
-        st.warning(f"Factor decomposition unavailable: {_fd.get('error', 'Unknown error')}. "
-                   "Requires pandas-datareader and internet access to Ken French library.")
-    else:
-        # Metric row
-        _fc1, _fc2, _fc3, _fc4 = st.columns(4)
-        _fc1.metric("Systematic Risk", f"{_fd['systematic_risk_pct']:.1f}%",
-                    help="% of return variance explained by FF factors")
-        _fc2.metric("Idiosyncratic Risk", f"{_fd['idiosyncratic_risk_pct']:.1f}%",
-                    help="% unexplained = pure company-specific risk")
-        _fc3.metric("Alpha (ann.)", f"{_fd['alpha']:.1%}",
-                    help=f"t-stat: {_fd['alpha_tstat']:.1f} | p: {_fd['alpha_pvalue']:.3f}")
-        _fc4.metric("Model Quality", _fd["factor_model_quality"],
-                    help=f"R²={_fd['r_squared']:.3f} | {_fd['n_months']} months")
-
-        # Stacked bar: variance decomposition
-        _fc_data = _fd.get("factor_contributions", {})
-        if _fc_data:
-            _idio_share = _fd["idiosyncratic_risk_pct"]
-            _sys_share = _fd["systematic_risk_pct"]
-            _bar_labels = list(_fc_data.keys()) + ["Idiosyncratic"]
-            # Factor contributions are % of systematic, scale to % of total
-            _bar_vals = [v * _sys_share / 100 for v in _fc_data.values()] + [_idio_share]
-            _bar_colors = ["#3498db", "#e74c3c", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#95a5a6"]
-            _fig_decomp = go.Figure(go.Bar(
-                x=_bar_labels, y=_bar_vals,
-                marker_color=_bar_colors[:len(_bar_labels)],
-                text=[f"{v:.1f}%" for v in _bar_vals],
-                textposition="outside",
-            ))
-            _fig_decomp.update_layout(
-                title=f"{_ticker} — Variance Decomposition (% of Total Risk)",
-                yaxis_title="% of Total Variance",
-                template=DARK, height=350,
-                yaxis=dict(range=[0, max(_bar_vals) * 1.3]),
-            )
-            st.plotly_chart(_fig_decomp, use_container_width=True)
-
-        # Factor loadings table
-        _factor_rows = [
-            ("Market (Mkt-RF)", _fd.get("beta_market"), _fd.get("tstat_market")),
-            ("Size (SMB)", _fd.get("beta_size"), _fd.get("tstat_size")),
-            ("Value (HML)", _fd.get("beta_value"), _fd.get("tstat_value")),
-            ("Profitability (RMW)", _fd.get("beta_profitability"), _fd.get("tstat_profitability")),
-            ("Investment (CMA)", _fd.get("beta_investment"), _fd.get("tstat_investment")),
-            ("Momentum (Mom)", _fd.get("beta_momentum"), _fd.get("tstat_momentum")),
-        ]
-        _interpretations = {
-            "Market (Mkt-RF)": lambda b: "High mkt sensitivity" if b > 1.5 else "Low beta defensive" if b < 0.5 else "Average market exposure",
-            "Size (SMB)": lambda b: "Small-cap tilt" if b > 0.3 else "Large-cap tilt" if b < -0.3 else "Size-neutral",
-            "Value (HML)": lambda b: "Value stock" if b > 0.3 else "Growth/momentum" if b < -0.3 else "Blend",
-            "Profitability (RMW)": lambda b: "High profitability" if b > 0.2 else "Low profitability" if b < -0.2 else "Average profitability",
-            "Investment (CMA)": lambda b: "Conservative investment" if b > 0.2 else "Aggressive investment" if b < -0.2 else "Average investment",
-            "Momentum (Mom)": lambda b: "Strong momentum" if b > 0.3 else "Contrarian/reversal" if b < -0.3 else "Neutral momentum",
-        }
-        _tbl_data = []
-        for fname, beta, tstat in _factor_rows:
-            if beta is None:
-                continue
-            sig = "YES ✓" if tstat is not None and abs(tstat) > 2.0 else "no"
-            interp = _interpretations.get(fname, lambda b: "")(beta)
-            _tbl_data.append({
-                "Factor": fname,
-                "Beta": f"{beta:.3f}",
-                "T-stat": f"{tstat:.1f}" if tstat is not None else "N/A",
-                "Significant?": sig,
-                "Interpretation": interp,
-            })
-        if _tbl_data:
-            st.dataframe(pd.DataFrame(_tbl_data), use_container_width=True, hide_index=True)
-
-        # Alpha box
-        _at = _fd.get("alpha_tstat", 0)
-        _aa = _fd.get("alpha", 0)
-        if abs(_at) > 2.0:
-            _ac = "#2ecc71" if _aa > 0 else "#e74c3c"
-            st.markdown(
-                f"<div style='background:{_ac}22;border-left:4px solid {_ac};padding:10px 16px;border-radius:4px;margin:8px 0'>"
-                f"<b style='color:{_ac}'>{'✅' if _aa > 0 else '❌'} Significant Alpha: {_aa:.1%} annualized (t={_at:.1f})</b><br>"
-                f"<span style='color:#ddd;font-size:13px'>"
-                f"{'This stock has historically generated returns BEYOND what factor exposures predict.' if _aa > 0 else 'This stock has historically UNDERPERFORMED relative to its factor exposures.'}"
-                f"</span></div>", unsafe_allow_html=True)
+if _sm_s2 is not None:
+    with _sm_s2:
+        st.subheader(f"Factor & Shock Analysis — {_ticker}")
+    
+        _factor_key = f"factor_{_ticker}"
+        _shock_key = f"shock_{_ticker}"
+    
+        if _factor_key not in st.session_state:
+            with st.spinner("Running Fama-French factor decomposition..."):
+                try:
+                    _fd = factor_decomposition(prices, start_date, end_date)
+                except Exception as _fe:
+                    _fd = {"available": False, "error": str(_fe)}
+            st.session_state[_factor_key] = _fd
+        if _shock_key not in st.session_state:
+            with st.spinner("Analyzing sector-specific price shocks..."):
+                try:
+                    _sd = analyze_price_shock(_ticker, info.get("sector", "Unknown"), prices, start_date, end_date)
+                except Exception as _se:
+                    _sd = {"available": False, "error": str(_se)}
+            st.session_state[_shock_key] = _sd
+    
+        _fd = st.session_state[_factor_key]
+        _sd = st.session_state[_shock_key]
+    
+        # ── SECTION 1: FAMA-FRENCH DECOMPOSITION ─────────────────────────────────
+        st.markdown("---")
+        st.subheader("🔬 Section 1: Fama-French 5-Factor + Momentum Decomposition")
+    
+        if not _fd.get("available", False):
+            st.warning(f"Factor decomposition unavailable: {_fd.get('error', 'Unknown error')}. "
+                       "Requires pandas-datareader and internet access to Ken French library.")
         else:
-            st.info(f"Factor model explains returns well (R²={_fd['r_squared']:.3f}). No statistically significant alpha (t={_at:.1f}).")
-
-        # Interpretation flags
-        _flags = _fd.get("interpretation_flags", [])
-        if _flags:
-            for _fl in _flags:
-                st.warning(_fl)
-
-        # Rolling factor exposure chart
-        _rb = _fd.get("rolling_beta_market")
-        _rr2 = _fd.get("rolling_r2")
-        if _rb is not None and not _rb.empty and _rr2 is not None and not _rr2.empty:
-            _fig_roll = go.Figure()
-            _fig_roll.add_trace(go.Scatter(
-                x=_rb.index, y=_rb, name="Rolling β Market",
-                line=dict(color="#3498db", width=2),
-            ))
-            _fig_roll.add_hline(y=1.0, line_dash="dot", line_color="gray",
-                                annotation_text="β=1")
-            _fig_roll.update_layout(
-                title=f"{_ticker} — Rolling Market Beta (63-month window)",
-                yaxis_title="Beta", template=DARK, height=280,
-            )
-            st.plotly_chart(_fig_roll, use_container_width=True)
-
-        # Idiosyncratic risk panel
-        st.markdown("**Pure Idiosyncratic Risk** (after removing all factor exposures)")
-        _ic1, _ic2, _ic3 = st.columns(3)
-        _ic1.metric("Idio Vol (ann.)", f"{_fd['idio_vol']:.1%}")
-        _ic2.metric("Idio VaR 95% (monthly)", f"{_fd['idio_var_95']:.2%}")
-        _ic3.metric("Idio CVaR 99% (monthly)", f"{_fd['idio_cvar_99']:.2%}" if _fd.get("idio_cvar_99") else "N/A")
-
-    # ── SECTION 2: SECTOR-SPECIFIC SHOCK ANALYSIS ─────────────────────────────
-    st.markdown("---")
-    _sector_val = info.get("sector", "Unknown")
-    _industry_val = info.get("industry", "Unknown")
-    st.subheader(f"💥 Section 2: Price Shock Sensitivity — {_sector_val}")
-
-    if not _sd.get("available", False):
-        st.warning(f"Shock analysis unavailable: {_sd.get('error', 'Need 18+ months of data')}")
-    else:
-        # Current shock risk indicators
-        _csr = _sd.get("current_shock_risk", {})
-        if _csr:
-            _risk_cols = st.columns(min(len(_csr), 4))
-            _risk_colors = {"ELEVATED": "#e74c3c", "NORMAL": "#f39c12", "SUBDUED": "#2ecc71"}
-            for i, (factor, level) in enumerate(_csr.items()):
-                with _risk_cols[i % 4]:
-                    _rc = _risk_colors.get(level, "#95a5a6")
-                    st.markdown(
-                        f"<div style='background:{_rc}22;border:1px solid {_rc};border-radius:6px;"
-                        f"padding:8px 12px;text-align:center;margin-bottom:8px'>"
-                        f"<b style='color:{_rc}'>{level}</b><br>"
-                        f"<small style='color:#ccc'>{factor}</small>"
-                        f"</div>", unsafe_allow_html=True)
-
-        # Historical shock response tables per factor
-        _hr = _sd.get("historical_responses", {})
-        for factor_name, factor_data in _hr.items():
-            with st.expander(f"📈 {factor_name} — Historical Shock Responses", expanded=False):
-                _note = factor_data.get("note", "")
-                _trans = factor_data.get("transmission", "")
-                if _note:
-                    st.caption(f"Transmission: **{_trans}** | {_note}")
-
-                _shock_dict = factor_data.get("shocks", {})
-                if not _shock_dict:
-                    st.info("No shock data available.")
-                    continue
-
-                # Build heatmap data
-                _shock_labels = list(_shock_dict.keys())
-                _same_m = []
-                _next_m = []
-                _three_m = []
-                _conf = []
-                _n_eps = []
-
-                for slabel in _shock_labels:
-                    sd_entry = _shock_dict[slabel]
-                    _n_eps.append(sd_entry.get("episodes_found", 0))
-                    _conf.append(sd_entry.get("confidence", "INSUFFICIENT"))
-                    same = sd_entry.get("same_month", {})
-                    nxt = sd_entry.get("next_month", {})
-                    thr = sd_entry.get("three_month", {})
-                    _same_m.append(same.get("median", np.nan))
-                    _next_m.append(nxt.get("median", np.nan))
-                    _three_m.append(thr.get("median", np.nan))
-
-                _hm_df = pd.DataFrame({
-                    "Shock": _shock_labels,
-                    "Episodes": _n_eps,
-                    "Confidence": _conf,
-                    "Same Month (median)": [f"{v:.1%}" if not np.isnan(v) else "N/A" for v in _same_m],
-                    "Next Month (median)": [f"{v:.1%}" if not np.isnan(v) else "N/A" for v in _next_m],
-                    "3-Month (median)": [f"{v:.1%}" if not np.isnan(v) else "N/A" for v in _three_m],
-                })
-                st.dataframe(_hm_df, use_container_width=True, hide_index=True)
-
-                # Worst case panel
-                _worst_3m = min(
-                    (v for v in _three_m if not np.isnan(v)), default=np.nan
+            # Metric row
+            _fc1, _fc2, _fc3, _fc4 = st.columns(4)
+            _fc1.metric("Systematic Risk", f"{_fd['systematic_risk_pct']:.1f}%",
+                        help="% of return variance explained by FF factors")
+            _fc2.metric("Idiosyncratic Risk", f"{_fd['idiosyncratic_risk_pct']:.1f}%",
+                        help="% unexplained = pure company-specific risk")
+            _fc3.metric("Alpha (ann.)", f"{_fd['alpha']:.1%}",
+                        help=f"t-stat: {_fd['alpha_tstat']:.1f} | p: {_fd['alpha_pvalue']:.3f}")
+            _fc4.metric("Model Quality", _fd["factor_model_quality"],
+                        help=f"R²={_fd['r_squared']:.3f} | {_fd['n_months']} months")
+    
+            # Stacked bar: variance decomposition
+            _fc_data = _fd.get("factor_contributions", {})
+            if _fc_data:
+                _idio_share = _fd["idiosyncratic_risk_pct"]
+                _sys_share = _fd["systematic_risk_pct"]
+                _bar_labels = list(_fc_data.keys()) + ["Idiosyncratic"]
+                # Factor contributions are % of systematic, scale to % of total
+                _bar_vals = [v * _sys_share / 100 for v in _fc_data.values()] + [_idio_share]
+                _bar_colors = ["#3498db", "#e74c3c", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#95a5a6"]
+                _fig_decomp = go.Figure(go.Bar(
+                    x=_bar_labels, y=_bar_vals,
+                    marker_color=_bar_colors[:len(_bar_labels)],
+                    text=[f"{v:.1f}%" for v in _bar_vals],
+                    textposition="outside",
+                ))
+                _fig_decomp.update_layout(
+                    title=f"{_ticker} — Variance Decomposition (% of Total Risk)",
+                    yaxis_title="% of Total Variance",
+                    template=DARK, height=350,
+                    yaxis=dict(range=[0, max(_bar_vals) * 1.3]),
                 )
-                if not np.isnan(_worst_3m) and _worst_3m < -0.05:
-                    st.markdown(
-                        f"<div style='background:#e74c3c22;border-left:3px solid #e74c3c;"
-                        f"padding:8px 14px;border-radius:4px;margin-top:8px'>"
-                        f"<b style='color:#e74c3c'>Worst median 3-month response: {_worst_3m:.1%}</b> "
-                        f"across all shock magnitudes for this factor."
-                        f"</div>", unsafe_allow_html=True)
-
-        # Compound shock scenario
-        _comp = _sd.get("compound_scenario")
-        if _comp:
-            st.markdown("---")
-            st.subheader("🌪️ Compound Shock Scenario")
-            st.markdown(
-                f"<div style='background:#8e44ad22;border-left:4px solid #8e44ad;"
-                f"padding:12px 18px;border-radius:6px'>"
-                f"<b style='color:#8e44ad;font-size:16px'>{_comp['name']}</b><br>"
-                f"<span style='color:#ccc'>{_comp['description']}</span>"
-                f"</div>", unsafe_allow_html=True)
+                st.plotly_chart(_fig_decomp, use_container_width=True)
+    
+            # Factor loadings table
+            _factor_rows = [
+                ("Market (Mkt-RF)", _fd.get("beta_market"), _fd.get("tstat_market")),
+                ("Size (SMB)", _fd.get("beta_size"), _fd.get("tstat_size")),
+                ("Value (HML)", _fd.get("beta_value"), _fd.get("tstat_value")),
+                ("Profitability (RMW)", _fd.get("beta_profitability"), _fd.get("tstat_profitability")),
+                ("Investment (CMA)", _fd.get("beta_investment"), _fd.get("tstat_investment")),
+                ("Momentum (Mom)", _fd.get("beta_momentum"), _fd.get("tstat_momentum")),
+            ]
+            _interpretations = {
+                "Market (Mkt-RF)": lambda b: "High mkt sensitivity" if b > 1.5 else "Low beta defensive" if b < 0.5 else "Average market exposure",
+                "Size (SMB)": lambda b: "Small-cap tilt" if b > 0.3 else "Large-cap tilt" if b < -0.3 else "Size-neutral",
+                "Value (HML)": lambda b: "Value stock" if b > 0.3 else "Growth/momentum" if b < -0.3 else "Blend",
+                "Profitability (RMW)": lambda b: "High profitability" if b > 0.2 else "Low profitability" if b < -0.2 else "Average profitability",
+                "Investment (CMA)": lambda b: "Conservative investment" if b > 0.2 else "Aggressive investment" if b < -0.2 else "Average investment",
+                "Momentum (Mom)": lambda b: "Strong momentum" if b > 0.3 else "Contrarian/reversal" if b < -0.3 else "Neutral momentum",
+            }
+            _tbl_data = []
+            for fname, beta, tstat in _factor_rows:
+                if beta is None:
+                    continue
+                sig = "YES ✓" if tstat is not None and abs(tstat) > 2.0 else "no"
+                interp = _interpretations.get(fname, lambda b: "")(beta)
+                _tbl_data.append({
+                    "Factor": fname,
+                    "Beta": f"{beta:.3f}",
+                    "T-stat": f"{tstat:.1f}" if tstat is not None else "N/A",
+                    "Significant?": sig,
+                    "Interpretation": interp,
+                })
+            if _tbl_data:
+                st.dataframe(pd.DataFrame(_tbl_data), use_container_width=True, hide_index=True)
+    
+            # Alpha box
+            _at = _fd.get("alpha_tstat", 0)
+            _aa = _fd.get("alpha", 0)
+            if abs(_at) > 2.0:
+                _ac = "#2ecc71" if _aa > 0 else "#e74c3c"
+                st.markdown(
+                    f"<div style='background:{_ac}22;border-left:4px solid {_ac};padding:10px 16px;border-radius:4px;margin:8px 0'>"
+                    f"<b style='color:{_ac}'>{'✅' if _aa > 0 else '❌'} Significant Alpha: {_aa:.1%} annualized (t={_at:.1f})</b><br>"
+                    f"<span style='color:#ddd;font-size:13px'>"
+                    f"{'This stock has historically generated returns BEYOND what factor exposures predict.' if _aa > 0 else 'This stock has historically UNDERPERFORMED relative to its factor exposures.'}"
+                    f"</span></div>", unsafe_allow_html=True)
+            else:
+                st.info(f"Factor model explains returns well (R²={_fd['r_squared']:.3f}). No statistically significant alpha (t={_at:.1f}).")
+    
+            # Interpretation flags
+            _flags = _fd.get("interpretation_flags", [])
+            if _flags:
+                for _fl in _flags:
+                    st.warning(_fl)
+    
+            # Rolling factor exposure chart
+            _rb = _fd.get("rolling_beta_market")
+            _rr2 = _fd.get("rolling_r2")
+            if _rb is not None and not _rb.empty and _rr2 is not None and not _rr2.empty:
+                _fig_roll = go.Figure()
+                _fig_roll.add_trace(go.Scatter(
+                    x=_rb.index, y=_rb, name="Rolling β Market",
+                    line=dict(color="#3498db", width=2),
+                ))
+                _fig_roll.add_hline(y=1.0, line_dash="dot", line_color="gray",
+                                    annotation_text="β=1")
+                _fig_roll.update_layout(
+                    title=f"{_ticker} — Rolling Market Beta (63-month window)",
+                    yaxis_title="Beta", template=DARK, height=280,
+                )
+                st.plotly_chart(_fig_roll, use_container_width=True)
+    
+            # Idiosyncratic risk panel
+            st.markdown("**Pure Idiosyncratic Risk** (after removing all factor exposures)")
+            _ic1, _ic2, _ic3 = st.columns(3)
+            _ic1.metric("Idio Vol (ann.)", f"{_fd['idio_vol']:.1%}")
+            _ic2.metric("Idio VaR 95% (monthly)", f"{_fd['idio_var_95']:.2%}")
+            _ic3.metric("Idio CVaR 99% (monthly)", f"{_fd['idio_cvar_99']:.2%}" if _fd.get("idio_cvar_99") else "N/A")
+    
+        # ── SECTION 2: SECTOR-SPECIFIC SHOCK ANALYSIS ─────────────────────────────
+        st.markdown("---")
+        _sector_val = info.get("sector", "Unknown")
+        _industry_val = info.get("industry", "Unknown")
+        st.subheader(f"💥 Section 2: Price Shock Sensitivity — {_sector_val}")
+    
+        if not _sd.get("available", False):
+            st.warning(f"Shock analysis unavailable: {_sd.get('error', 'Need 18+ months of data')}")
+        else:
+            # Current shock risk indicators
+            _csr = _sd.get("current_shock_risk", {})
+            if _csr:
+                _risk_cols = st.columns(min(len(_csr), 4))
+                _risk_colors = {"ELEVATED": "#e74c3c", "NORMAL": "#f39c12", "SUBDUED": "#2ecc71"}
+                for i, (factor, level) in enumerate(_csr.items()):
+                    with _risk_cols[i % 4]:
+                        _rc = _risk_colors.get(level, "#95a5a6")
+                        st.markdown(
+                            f"<div style='background:{_rc}22;border:1px solid {_rc};border-radius:6px;"
+                            f"padding:8px 12px;text-align:center;margin-bottom:8px'>"
+                            f"<b style='color:{_rc}'>{level}</b><br>"
+                            f"<small style='color:#ccc'>{factor}</small>"
+                            f"</div>", unsafe_allow_html=True)
+    
+            # Historical shock response tables per factor
+            _hr = _sd.get("historical_responses", {})
+            for factor_name, factor_data in _hr.items():
+                with st.expander(f"📈 {factor_name} — Historical Shock Responses", expanded=False):
+                    _note = factor_data.get("note", "")
+                    _trans = factor_data.get("transmission", "")
+                    if _note:
+                        st.caption(f"Transmission: **{_trans}** | {_note}")
+    
+                    _shock_dict = factor_data.get("shocks", {})
+                    if not _shock_dict:
+                        st.info("No shock data available.")
+                        continue
+    
+                    # Build heatmap data
+                    _shock_labels = list(_shock_dict.keys())
+                    _same_m = []
+                    _next_m = []
+                    _three_m = []
+                    _conf = []
+                    _n_eps = []
+    
+                    for slabel in _shock_labels:
+                        sd_entry = _shock_dict[slabel]
+                        _n_eps.append(sd_entry.get("episodes_found", 0))
+                        _conf.append(sd_entry.get("confidence", "INSUFFICIENT"))
+                        same = sd_entry.get("same_month", {})
+                        nxt = sd_entry.get("next_month", {})
+                        thr = sd_entry.get("three_month", {})
+                        _same_m.append(same.get("median", np.nan))
+                        _next_m.append(nxt.get("median", np.nan))
+                        _three_m.append(thr.get("median", np.nan))
+    
+                    _hm_df = pd.DataFrame({
+                        "Shock": _shock_labels,
+                        "Episodes": _n_eps,
+                        "Confidence": _conf,
+                        "Same Month (median)": [f"{v:.1%}" if not np.isnan(v) else "N/A" for v in _same_m],
+                        "Next Month (median)": [f"{v:.1%}" if not np.isnan(v) else "N/A" for v in _next_m],
+                        "3-Month (median)": [f"{v:.1%}" if not np.isnan(v) else "N/A" for v in _three_m],
+                    })
+                    st.dataframe(_hm_df, use_container_width=True, hide_index=True)
+    
+                    # Worst case panel
+                    _worst_3m = min(
+                        (v for v in _three_m if not np.isnan(v)), default=np.nan
+                    )
+                    if not np.isnan(_worst_3m) and _worst_3m < -0.05:
+                        st.markdown(
+                            f"<div style='background:#e74c3c22;border-left:3px solid #e74c3c;"
+                            f"padding:8px 14px;border-radius:4px;margin-top:8px'>"
+                            f"<b style='color:#e74c3c'>Worst median 3-month response: {_worst_3m:.1%}</b> "
+                            f"across all shock magnitudes for this factor."
+                            f"</div>", unsafe_allow_html=True)
+    
+            # Compound shock scenario
+            _comp = _sd.get("compound_scenario")
+            if _comp:
+                st.markdown("---")
+                st.subheader("🌪️ Compound Shock Scenario")
+                st.markdown(
+                    f"<div style='background:#8e44ad22;border-left:4px solid #8e44ad;"
+                    f"padding:12px 18px;border-radius:6px'>"
+                    f"<b style='color:#8e44ad;font-size:16px'>{_comp['name']}</b><br>"
+                    f"<span style='color:#ccc'>{_comp['description']}</span>"
+                    f"</div>", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — AI ANALYST
+# PAGE 6 — AI ANALYST
 # ══════════════════════════════════════════════════════════════════════════════
-with tab6:
+elif _page == "🤖 AI Analyst":
     import re as _re
     from datetime import datetime as _dt
 
