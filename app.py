@@ -9,6 +9,15 @@ warnings.filterwarnings("ignore")
 
 import os
 import streamlit as st
+
+# ── Page config — MUST be first Streamlit call ────────────────────────────────
+st.set_page_config(
+    page_title="Market Risk Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -60,10 +69,25 @@ from ai.analyst import (
 )
 from data.driver_discovery import discover_risk_drivers
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Risk Dashboard", layout="wide", page_icon="📊")
-
 DARK = "plotly_dark"
+
+
+def init_session_state():
+    defaults = {
+        "horizon": "1 Month",
+        "data_loaded": False,
+        "current_ticker": None,
+        "fast_ma": 20,
+        "slow_ma": 50,
+        "sizing_method": "vol_target",
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+init_session_state()
+
 REGIME_COLORS = {
     "RISK_ON": "#2ecc71",
     "RISK_OFF": "#e74c3c",
@@ -96,14 +120,14 @@ with st.sidebar:
             if _k.startswith("ai_report_") or _k.startswith("ai_ctx_") or _k.startswith("synopsis_"):
                 del st.session_state[_k]
         st.session_state["horizon"] = horizon
-    load = st.button("Load Data", type="primary")
+    st.divider()
+    load = st.button("🚀 Load Data", type="primary", use_container_width=True)
+    if st.session_state.get("data_loaded") and st.session_state.get("current_ticker") == ticker:
+        st.caption(f"⚡ {ticker} loaded · click to refresh")
 
 st.title("📊 Market Risk Dashboard")
 
 # ── Data loading ──────────────────────────────────────────────────────────────
-if "data_loaded" not in st.session_state:
-    st.session_state.data_loaded = False
-
 if load:
     _progress = st.progress(0, text="Fetching price data...")
     df = fetch_ohlcv(ticker, start_date, end_date)
@@ -129,6 +153,7 @@ if load:
     st.session_state.ticker = ticker
     st.session_state.benchmark = benchmark
     st.session_state["horizon"] = horizon
+    st.session_state["current_ticker"] = ticker
     # Clear stale cached computations when new data is loaded
     for _k in list(st.session_state.keys()):
         if any(_k.startswith(p) for p in ("bt_", "fund_", "smart_money_",
@@ -185,14 +210,6 @@ simple_r = prices.pct_change().dropna()
 
 # Retrieve horizon from session state (set in sidebar)
 _horizon = st.session_state.get("horizon", "1 Month")
-
-# Fast MA / Slow MA stored separately so Backtester tab can expose them
-if "fast_ma" not in st.session_state:
-    st.session_state["fast_ma"] = 20
-if "slow_ma" not in st.session_state:
-    st.session_state["slow_ma"] = 50
-if "sizing_method" not in st.session_state:
-    st.session_state["sizing_method"] = "vol_target"
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -1421,16 +1438,22 @@ with _sm_s1:
         except Exception as _e:
             _sm_progress.empty()
             st.error(f"EDGAR data load failed: {_e}")
-            st.stop()
+            st.session_state[_sm_key] = ("ERROR", None, {}, None, {}, None, {})
 
     (_cik_val, _insider_df, _insider_signals,
      _inst_df, _inst_signals, _activist_df, _xbrl) = st.session_state[_sm_key]
 
-    if not _cik_val:
-        st.error(f"Could not resolve CIK for {_ticker}. EDGAR data unavailable.")
-        st.stop()
-
-    st.caption(f"CIK: {_cik_val}  |  Data source: SEC EDGAR (free API)")
+    if not _cik_val or _cik_val == "ERROR":
+        st.warning(f"EDGAR data unavailable for {_ticker}. CIK could not be resolved.")
+        _cik_val = None
+        _insider_df = pd.DataFrame()
+        _insider_signals = {}
+        _inst_df = pd.DataFrame()
+        _inst_signals = {"n_adding": 0, "n_reducing": 0, "n_new": 0, "n_closed": 0, "signal": "NEUTRAL"}
+        _activist_df = pd.DataFrame()
+        _xbrl = {"source": "unavailable"}
+    else:
+        st.caption(f"CIK: {_cik_val}  |  Data source: SEC EDGAR (free API)")
 
     # ── SECTION 1: INSIDER ACTIVITY ──────────────────────────────────────────
     st.markdown("---")
@@ -1942,17 +1965,39 @@ with tab6:
     if not _has_tavily:
         st.warning("**TAVILY_API_KEY not set** — web research disabled. Report will use only computed metrics.")
 
-    # ── Generate report ───────────────────────────────────────────────────────
+    # ── Deferred generation — show button until user triggers ─────────────────
+    _dp_ai = st.session_state.get(f"driver_{_ticker}")
+    _top_driver_name = (_dp_ai.get("primary_drivers", [{}])[0].get("name", "primary sector driver")
+                        if _dp_ai and _dp_ai.get("primary_drivers") else "primary sector driver")
+
     if _ai_key not in st.session_state:
+        _gen_col1, _gen_col2 = st.columns([3, 1])
+        with _gen_col1:
+            st.write(
+                f"Generate **{_horizon}** risk analysis for **{_ticker}** using DeepSeek + live web research.  \n"
+                f"Will lead with: **{_top_driver_name}**"
+            )
+        with _gen_col2:
+            _generate_clicked = st.button("Generate Analysis →", type="primary", key="gen_ai")
+        if not _generate_clicked:
+            st.info(
+                f"AI analysis will:\n"
+                f"- Lead with {_ticker}'s highest-relevance risk driver\n"
+                f"- Search live news and analyst reports\n"
+                f"- Generate sector-specific risk narrative\n"
+                f"- Focus on **{_horizon}** horizon\n\n"
+                f"Takes ~15–20 seconds to generate."
+            )
+            st.stop()
+
         _smart_sm = st.session_state.get(f"smart_money_{_ticker}")
         _insider_sig_ai = _smart_sm[2] if _smart_sm else None
         _inst_sig_ai = _smart_sm[4] if _smart_sm else None
         _activist_ai = _smart_sm[5] if _smart_sm else None
-        _factor_ai = st.session_state.get(_factor_key)
-        _dp_ai = st.session_state.get(f"driver_{_ticker}")
+        _factor_ai = st.session_state.get(f"factor_{_ticker}")
 
-        _status = st.empty()
-        _status.write("🤖 AI analyst reading metrics...")
+        _s1 = st.empty()
+        _s1.write("🤖 AI analyst reading metrics...")
         try:
             _ai_ctx = build_ticker_context(
                 _ticker, prices, volume, bench_prices, info, macro_df,
@@ -1966,18 +2011,18 @@ with tab6:
             )
             st.session_state[_ctx_key] = _ai_ctx
 
-            _status.write("🔍 Searching recent news and analyst reports...")
+            _s1.write("🔍 Searching recent news and analyst reports...")
             _web_res = fetch_web_research(
                 _ticker, info.get("name", _ticker), info.get("sector", ""),
                 driver_profile=_dp_ai, horizon=_horizon,
             )
 
-            _status.write("✍️ Writing research report...")
+            _s1.write("✍️ Writing research report...")
             _report = generate_research_report(_ai_ctx, _web_res, driver_profile=_dp_ai)
             st.session_state[_ai_key] = (_report, _web_res, len(_web_res))
-            _status.empty()
+            _s1.empty()
         except Exception as _ae:
-            _status.empty()
+            _s1.empty()
             st.error(f"Report generation failed: {_ae}")
             st.session_state[_ai_key] = (f"_Error: {_ae}_", [], 0)
 
@@ -2093,7 +2138,6 @@ with tab6:
     if st.session_state[_chat_key]:
         if st.button("🗑️ Clear chat", key=f"clear_chat_{_ticker}"):
             st.session_state[_chat_key] = []
-            st.rerun()
 
     # ── SECTION 3: SCENARIO ANALYSIS ─────────────────────────────────────────
     st.divider()

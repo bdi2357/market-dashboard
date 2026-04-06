@@ -576,14 +576,55 @@ def chat_with_analyst(
 
     ctx_block = _build_context_block(context)
 
+    _sector = context.get("sector", "")
+    _industry = context.get("industry", "")
+    _ticker_sym = context["ticker"]
+
+    # Build sector-specific relevance guidance
+    _sector_lower = _sector.lower()
+    _industry_lower = _industry.lower()
+    if any(s in _sector_lower or s in _industry_lower for s in ["technology", "semiconductor", "software"]):
+        _sector_rules = (
+            f"SECTOR RULES for {_ticker_sym} ({_sector}/{_industry}):\n"
+            "- DO mention: AI demand, chip competition (AMD/Intel), export controls (China), "
+            "data center capex, TSMC manufacturing risk, USD/Asia FX.\n"
+            "- DO NOT mention crude oil, jet fuel, wheat, freight rates, or agricultural prices "
+            "— they are not relevant to this company's P&L."
+        )
+    elif any(s in _sector_lower or s in _industry_lower for s in ["airline", "aviation"]):
+        _sector_rules = (
+            f"SECTOR RULES for {_ticker_sym} ({_sector}/{_industry}):\n"
+            "- ALWAYS lead with jet fuel / crude oil if risk-related — it is the primary cost driver.\n"
+            "- DO NOT mention AI chip demand, semiconductor supply, cloud subscriptions."
+        )
+    elif any(s in _sector_lower or s in _industry_lower for s in ["bank", "financial", "insurance"]):
+        _sector_rules = (
+            f"SECTOR RULES for {_ticker_sym} ({_sector}/{_industry}):\n"
+            "- Lead with: federal funds rate, credit spreads, loan default risk, yield curve.\n"
+            "- DO NOT mention jet fuel, crude oil, agricultural prices, or semiconductor demand."
+        )
+    elif any(s in _sector_lower or s in _industry_lower for s in ["energy", "oil", "gas"]):
+        _sector_rules = (
+            f"SECTOR RULES for {_ticker_sym} ({_sector}/{_industry}):\n"
+            "- Lead with: crude oil / natural gas price, reserve life, E&P capex cycle.\n"
+            "- DO NOT mention AI chip demand, semiconductor, or agricultural prices."
+        )
+    else:
+        _sector_rules = (
+            f"Only cite factors that directly affect {_ticker_sym}'s P&L. "
+            "Do not use generic macro factors that belong on Yahoo Finance."
+        )
+
     system_content = f"""You are a senior equity risk analyst. Answer like briefing a PM before market open.
 
-Stock: {context['ticker']} | {context['company']} | {context['sector']} / {context['industry']}
+Stock: {_ticker_sym} | {context['company']} | {_sector} / {_industry}
 Horizon: {horizon}
 
 PRIMARY RISK DRIVER RIGHT NOW:
 {top_driver_name} — {top_driver_factor}
 Relevance: {score_str}/3.0+ | Moving: {"YES" if top_driver_moving else "no"}
+
+{_sector_rules}
 
 === CURRENT DATA ===
 {ctx_block}
@@ -604,6 +645,7 @@ RULES:
 - Never start with "DATA SHOWS:" — you are an analyst, not a terminal.
 - Always mention {top_driver_name} if the question is risk-related.
 - Generic vol/beta answers belong on Yahoo Finance. Your value is sector-specific + company-specific.
+- Strictly follow the SECTOR RULES above. Violating them makes the analysis useless.
 - Total response under 200 words."""
 
     # Fetch web context for macro/sector questions

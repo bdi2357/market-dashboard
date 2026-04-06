@@ -348,6 +348,146 @@ def compute_relevance(factors: list[dict]) -> list[dict]:
     return factors
 
 
+# ── DRIVER RELEVANCE FILTERING ───────────────────────────────────────────────
+
+# Terms that are clearly irrelevant for a given sector
+_SECTOR_EXCLUSIONS: dict[str, list[str]] = {
+    "Technology": [
+        "jet fuel", "crude oil", "oil price", "natural gas", "fuel cost",
+        "wheat", "corn", "soybean", "agricultural", "fertilizer",
+        "freight rate", "shipping cost", "iron ore", "steel price",
+    ],
+    "Semiconductors": [
+        "jet fuel", "crude oil", "oil price", "natural gas",
+        "wheat", "corn", "soybean", "agricultural", "fertilizer",
+    ],
+    "Information Technology": [
+        "jet fuel", "crude oil", "oil price", "natural gas", "fuel cost",
+        "wheat", "corn", "soybean", "agricultural", "fertilizer",
+    ],
+    "Airlines": [
+        "ai chip demand", "semiconductor demand", "cloud subscription",
+        "software revenue", "data center", "memory price",
+    ],
+    "Financials": [
+        "jet fuel", "crude oil", "oil price", "agricultural", "wheat",
+        "corn", "soybean", "semiconductor demand",
+    ],
+    "Consumer Staples": [
+        "ai chip", "semiconductor", "jet fuel", "crude oil",
+        "data center", "cloud demand",
+    ],
+    "Energy": [
+        "ai chip", "semiconductor", "cloud demand", "wheat", "corn",
+        "soybean", "agricultural",
+    ],
+    "Healthcare": [
+        "jet fuel", "crude oil", "oil price", "wheat", "corn",
+        "soybean", "agricultural", "semiconductor demand",
+    ],
+}
+
+
+def filter_irrelevant_drivers(
+    factors: list[dict],
+    ticker: str,
+    sector: str,
+    industry: str,
+) -> list[dict]:
+    """
+    Remove drivers whose external_factor clearly doesn't apply
+    to this company's sector/industry.
+    """
+    # Build exclusion list from sector and industry lookups
+    exclusions: list[str] = []
+    for key, excl_list in _SECTOR_EXCLUSIONS.items():
+        if key.lower() in sector.lower() or key.lower() in industry.lower():
+            exclusions.extend(excl_list)
+
+    if not exclusions:
+        return factors
+
+    filtered = []
+    for factor in factors:
+        ext = (factor.get("external_factor") or "").lower()
+        desc = (factor.get("description") or "").lower()
+        name = (factor.get("name") or "").lower()
+        combined = f"{ext} {desc} {name}"
+        if any(excl in combined for excl in exclusions):
+            logger.debug(
+                f"Filtered irrelevant driver '{factor.get('name')}' "
+                f"for {ticker} ({sector}/{industry})"
+            )
+        else:
+            filtered.append(factor)
+    return filtered
+
+
+def validate_drivers_with_llm(
+    factors: list[dict],
+    ticker: str,
+    company: str,
+    sector: str,
+    industry: str,
+    openai_client,
+) -> list[dict]:
+    """
+    Ask the LLM to review and remove any drivers that don't actually
+    affect this specific company. Returns filtered list.
+    Falls back to the original list on any error.
+    """
+    if not openai_client or not factors:
+        return factors
+
+    factor_lines = "\n".join(
+        f"- {f.get('name','')}: {f.get('external_factor','')}"
+        for f in factors
+    )
+
+    prompt = f"""Company: {company} ({ticker})
+Sector: {sector} / Industry: {industry}
+
+Review these risk drivers and return ONLY the names that are genuinely relevant.
+
+Drivers:
+{factor_lines}
+
+Rules (be strict):
+- For Technology/Semiconductors: oil/fuel/agricultural are NOT relevant
+  unless there is a specific reason. AI demand, export controls, chip
+  competition, TSMC risk, data center capex ARE relevant.
+- For Airlines: fuel costs are PRIMARY. AI chip demand is NOT relevant.
+- For Banks/Financials: credit spread, fed funds, yield curve ARE relevant.
+  jet fuel, agricultural, semiconductor demand are NOT.
+- For Energy companies: oil/gas prices ARE relevant. Semiconductor demand
+  and agricultural prices are NOT.
+- Remove anything that is clearly a generic macro factor with no
+  specific transmission to this company's P&L.
+
+Return ONLY a valid JSON array of driver NAMES to keep. No other text."""
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model="deepseek/deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.1,
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"```json|```", "", raw).strip()
+        keep_names = json.loads(raw)
+        keep_lower = [k.lower() for k in keep_names]
+        validated = [
+            f for f in factors
+            if any(k in f.get("name", "").lower() for k in keep_lower)
+        ]
+        # Safety: if LLM removes everything, fall back to filter_irrelevant_drivers result
+        return validated if len(validated) >= 3 else factors
+    except Exception as e:
+        logger.warning(f"LLM driver validation failed: {e}")
+        return factors
+
+
 # ── MASTER FUNCTION ───────────────────────────────────────────────────────────
 
 def discover_risk_drivers(
@@ -410,7 +550,19 @@ def discover_risk_drivers(
     # Layer 3: news velocity
     factors = score_news_velocity(factors, ticker, company, tavily_client)
 
-    # Combined relevance score
+    # Combined relevance score + relevance filtering
+    factors = compute_relevance(factors)
+
+    # Remove drivers clearly irrelevant to this sector (fast rule-based pass)
+    factors = filter_irrelevant_drivers(factors, ticker, sector, industry)
+
+    # LLM validation pass — removes any remaining mismatches (only if openai available)
+    if openai_client and data_quality != "hardcoded_fallback":
+        factors = validate_drivers_with_llm(
+            factors, ticker, company, sector, industry, openai_client
+        )
+
+    # Re-score after filtering (priority labels may have shifted)
     factors = compute_relevance(factors)
 
     result = {
