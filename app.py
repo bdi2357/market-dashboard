@@ -1950,10 +1950,10 @@ with tab6:
 
     _ai_key = f"ai_report_{_ticker}"
     _ctx_key = f"ai_ctx_{_ticker}"
-    _chat_key = f"chat_{_ticker}"
+    _history_key = f"chat_history_{_ticker}"
 
-    if _chat_key not in st.session_state:
-        st.session_state[_chat_key] = []
+    if _history_key not in st.session_state:
+        st.session_state[_history_key] = []
 
     # Check API keys
     import os as _os
@@ -2155,86 +2155,80 @@ with tab6:
                 "I know its risk metrics, fundamentals, smart money positioning and live news"
             )
 
-            # Suggested questions as 2×3 compact buttons
-            _sector_str = _ai_ctx.get("sector", info.get("sector", ""))
+            # Build context — minimal baseline, upgraded with full ctx when report exists
+            _chat_ctx = {
+                "ticker": _ticker,
+                "company": info.get("longName", _ticker),
+                "sector": info.get("sector", ""),
+                "industry": info.get("industry", ""),
+                "horizon": _horizon,
+            }
+            if _ai_ctx:
+                _chat_ctx.update(_ai_ctx)
+
+            _top_name = _chat_ctx.get("top_driver_name", _top_driver_name)
+            _sector_str = _chat_ctx.get("sector", info.get("sector", ""))
+
+            # Suggested questions — click stores in session_state, picked up below
             _suggested_qs = [
-                f"What's the #1 risk for {_ticker} this week?",
-                f"How exposed is {_ticker} to {_top_driver_name}?",
-                "Is valuation justified given the risk profile?",
-                "What would make you bullish on this stock?",
+                f"What's the #1 risk for {_ticker} this {_horizon}?",
+                f"How exposed is {_ticker} to {_top_name}?",
+                f"What would make you bullish on {_ticker}?",
                 f"What are institutions doing with {_ticker}?",
-                f"Is the {_sector_str} sector at risk from current macro?",
+                f"Is {_ticker} cheap given its risk profile?",
+                f"Compare {_ticker} to 2020 COVID crash setup",
             ]
             st.write("**Try asking:**")
             _sq1, _sq2 = st.columns(2)
             for _qi, _q in enumerate(_suggested_qs):
-                _btn_lbl = _q[:42] + "…" if len(_q) > 42 else _q
+                _btn_lbl = _q[:40] + "…" if len(_q) > 40 else _q
                 if (_sq1 if _qi % 2 == 0 else _sq2).button(
-                    _btn_lbl, key=f"sq_{_qi}_{_ticker}", use_container_width=True
+                    _btn_lbl, key=f"sugg_{_ticker}_{_qi}", use_container_width=True
                 ):
-                    st.session_state["_pending_q"] = _q
+                    st.session_state[f"pending_chat_{_ticker}"] = _q
 
             st.divider()
 
-            # Chat history in a fixed-height scrollable container
-            _chat_box = st.container(height=420)
-            with _chat_box:
-                if not st.session_state[_chat_key]:
-                    st.markdown(
-                        f"👋 **Ready to discuss {_ticker}.**\n\n"
-                        "I have access to:\n"
-                        f"- Live risk metrics & factor model\n"
-                        f"- {_top_driver_name} price data\n"
-                        "- Recent news and analyst reports\n"
-                        "- Smart money positioning\n\n"
-                        "What would you like to know?"
-                    )
-                for _msg in st.session_state[_chat_key]:
-                    with st.chat_message(_msg["role"]):
-                        st.write(_msg["content"])
+            # Render existing chat history
+            for _msg in st.session_state[_history_key]:
+                with st.chat_message(_msg["role"]):
+                    st.markdown(_msg["content"])
 
-            # Resolve pending suggested-question click
-            _pending = st.session_state.pop("_pending_q", None)
-            if _pending:
-                st.session_state[f"_chat_prefill_{_ticker}"] = _pending
-
-            # ── Text input + Send button (avoids st.chat_input rerun) ─────────
-            _prefill = st.session_state.pop(f"_chat_prefill_{_ticker}", "")
-            _txt_col, _btn_col = st.columns([5, 1])
-            _typed = _txt_col.text_input(
-                "Ask your question:",
-                value=_prefill,
-                key=f"chat_text_{_ticker}",
-                label_visibility="collapsed",
-                placeholder=f"e.g. What is {_ticker}'s biggest risk right now?",
+            # ── THE ONLY CORRECT INPUT WIDGET ────────────────────────────────
+            # st.chat_input() preserves tab state on submit; st.button() does not.
+            _user_input = st.chat_input(
+                placeholder=f"Ask about {_ticker} risk, {_top_name} exposure, catalysts...",
+                key=f"chat_input_{_ticker}",
             )
-            _send = _btn_col.button("Send", key=f"chat_send_{_ticker}", use_container_width=True)
 
-            _active_q = _typed.strip() if _send and _typed.strip() else None
+            # Merge typed input with any pending suggestion button click
+            _active_q = _user_input or st.session_state.pop(
+                f"pending_chat_{_ticker}", None
+            )
 
-            if _active_q and _ai_ctx:
-                st.session_state[_chat_key].append(
+            if _active_q:
+                st.session_state[_history_key].append(
                     {"role": "user", "content": _active_q}
                 )
-                with _chat_box:
-                    with st.chat_message("user"):
-                        st.write(_active_q)
-                    with st.chat_message("assistant"):
-                        with st.spinner("Thinking..."):
-                            try:
-                                _answer = chat_with_analyst(
-                                    _active_q, _ai_ctx,
-                                    st.session_state[_chat_key][:-1],
-                                    driver_profile=_driver_profile_ai,
-                                )
-                            except Exception as _ce:
-                                _answer = f"_Chat error: {_ce}_"
-                        st.write(_answer)
-                        st.caption("⚠️ Research only — not financial advice")
-                st.session_state[_chat_key].append(
+                with st.chat_message("user"):
+                    st.markdown(_active_q)
+                with st.chat_message("assistant"):
+                    with st.spinner("Thinking..."):
+                        try:
+                            _answer = chat_with_analyst(
+                                _active_q, _chat_ctx,
+                                st.session_state[_history_key][:-1],
+                                driver_profile=_driver_profile_ai,
+                            )
+                        except Exception as _ce:
+                            _answer = f"_Chat error: {_ce}_"
+                    st.markdown(_answer)
+                    st.caption("⚠️ Research only — not financial advice")
+                st.session_state[_history_key].append(
                     {"role": "assistant", "content": _answer}
                 )
+                # DO NOT call st.rerun() here
 
-            if st.session_state[_chat_key]:
+            if st.session_state[_history_key]:
                 if st.button("🗑️ Clear chat", key=f"clear_chat_{_ticker}"):
-                    st.session_state[_chat_key] = []
+                    st.session_state[_history_key] = []

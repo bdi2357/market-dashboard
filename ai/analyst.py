@@ -578,7 +578,7 @@ def chat_with_analyst(
 
     _sector = context.get("sector", "")
     _industry = context.get("industry", "")
-    _ticker_sym = context["ticker"]
+    _ticker_sym = context.get("ticker", "?")
 
     # Build sector-specific relevance guidance
     _sector_lower = _sector.lower()
@@ -617,7 +617,7 @@ def chat_with_analyst(
 
     system_content = f"""You are a senior equity risk analyst. Answer like briefing a PM before market open.
 
-Stock: {_ticker_sym} | {context['company']} | {_sector} / {_industry}
+Stock: {_ticker_sym} | {context.get('company', _ticker_sym)} | {_sector} / {_industry}
 Horizon: {horizon}
 
 PRIMARY RISK DRIVER RIGHT NOW:
@@ -659,7 +659,9 @@ RULES:
         if any(kw in question.lower() for kw in domain_keywords):
             try:
                 web_hits = fetch_web_research(
-                    context["ticker"], context["company"], context["sector"],
+                    context.get("ticker", _ticker_sym),
+                    context.get("company", _ticker_sym),
+                    context.get("sector", ""),
                     driver_profile=driver_profile, horizon=horizon,
                 )
                 if web_hits:
