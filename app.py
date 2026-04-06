@@ -1945,12 +1945,17 @@ with _sm_s2:
 # TAB 6 — AI ANALYST
 # ══════════════════════════════════════════════════════════════════════════════
 with tab6:
-    st.subheader(f"🤖 AI Research Analyst — {_ticker}")
+    import re as _re
+    from datetime import datetime as _dt
 
     _ai_key = f"ai_report_{_ticker}"
     _ctx_key = f"ai_ctx_{_ticker}"
+    _chat_key = f"chat_{_ticker}"
 
-    # Check if API keys are present
+    if _chat_key not in st.session_state:
+        st.session_state[_chat_key] = []
+
+    # Check API keys
     import os as _os
     _has_openrouter = bool(_os.getenv("OPENROUTER_API_KEY"))
     _has_tavily = bool(_os.getenv("TAVILY_API_KEY"))
@@ -1960,215 +1965,269 @@ with tab6:
             "**OPENROUTER_API_KEY not found.** Add it to your `.env` file:\n"
             "```\nOPENROUTER_API_KEY=sk-or-...\nTAVILY_API_KEY=tvly-...\n```"
         )
-        st.stop()
+    else:
+        if not _has_tavily:
+            st.warning("**TAVILY_API_KEY not set** — web research disabled.")
 
-    if not _has_tavily:
-        st.warning("**TAVILY_API_KEY not set** — web research disabled. Report will use only computed metrics.")
+        _dp_ai = st.session_state.get(f"driver_{_ticker}")
+        _top_driver_name = (
+            _dp_ai.get("primary_drivers", [{}])[0].get("name", "primary sector driver")
+            if _dp_ai and _dp_ai.get("primary_drivers") else "primary sector driver"
+        )
 
-    # ── Deferred generation — show button until user triggers ─────────────────
-    _dp_ai = st.session_state.get(f"driver_{_ticker}")
-    _top_driver_name = (_dp_ai.get("primary_drivers", [{}])[0].get("name", "primary sector driver")
-                        if _dp_ai and _dp_ai.get("primary_drivers") else "primary sector driver")
+        _ai_ctx = st.session_state.get(_ctx_key, {})
+        _driver_profile_ai = _dp_ai
 
-    if _ai_key not in st.session_state:
-        _gen_col1, _gen_col2 = st.columns([3, 1])
-        with _gen_col1:
-            st.write(
-                f"Generate **{_horizon}** risk analysis for **{_ticker}** using DeepSeek + live web research.  \n"
-                f"Will lead with: **{_top_driver_name}**"
-            )
-        with _gen_col2:
-            _generate_clicked = st.button("Generate Analysis →", type="primary", key="gen_ai")
-        if not _generate_clicked:
-            st.info(
-                f"AI analysis will:\n"
-                f"- Lead with {_ticker}'s highest-relevance risk driver\n"
-                f"- Search live news and analyst reports\n"
-                f"- Generate sector-specific risk narrative\n"
-                f"- Focus on **{_horizon}** horizon\n\n"
-                f"Takes ~15–20 seconds to generate."
-            )
-            st.stop()
+        # ── TWO-COLUMN LAYOUT ─────────────────────────────────────────────────
+        _col_report, _col_chat = st.columns([6, 4])
 
-        _smart_sm = st.session_state.get(f"smart_money_{_ticker}")
-        _insider_sig_ai = _smart_sm[2] if _smart_sm else None
-        _inst_sig_ai = _smart_sm[4] if _smart_sm else None
-        _activist_ai = _smart_sm[5] if _smart_sm else None
-        _factor_ai = st.session_state.get(f"factor_{_ticker}")
+        # ── LEFT: REPORT ──────────────────────────────────────────────────────
+        with _col_report:
+            st.subheader(f"📋 Risk Analysis Report — {_ticker}")
 
-        _s1 = st.empty()
-        _s1.write("🤖 AI analyst reading metrics...")
-        try:
-            _ai_ctx = build_ticker_context(
-                _ticker, prices, volume, bench_prices, info, macro_df,
-                fund_scores=st.session_state.get("fund_scores"),
-                insider_signals=_insider_sig_ai,
-                inst_signals=_inst_sig_ai,
-                activist_df=_activist_ai,
-                factor_results=_factor_ai if _factor_ai and _factor_ai.get("available") else None,
-                driver_profile=_dp_ai,
-                horizon=_horizon,
-            )
-            st.session_state[_ctx_key] = _ai_ctx
+            _report_ready = _ai_key in st.session_state
 
-            _s1.write("🔍 Searching recent news and analyst reports...")
-            _web_res = fetch_web_research(
-                _ticker, info.get("name", _ticker), info.get("sector", ""),
-                driver_profile=_dp_ai, horizon=_horizon,
-            )
-
-            _s1.write("✍️ Writing research report...")
-            _report = generate_research_report(_ai_ctx, _web_res, driver_profile=_dp_ai)
-            st.session_state[_ai_key] = (_report, _web_res, len(_web_res))
-            _s1.empty()
-        except Exception as _ae:
-            _s1.empty()
-            st.error(f"Report generation failed: {_ae}")
-            st.session_state[_ai_key] = (f"_Error: {_ae}_", [], 0)
-
-    _report_text, _web_res_cached, _n_web = st.session_state[_ai_key]
-    _ai_ctx = st.session_state.get(_ctx_key, {})
-    _driver_profile_ai = st.session_state.get(f"driver_{_ticker}")
-
-    # ── Display report as expandable sections ─────────────────────────────────
-    import re as _re
-    _sections = _re.split(r"\n(?=##\s)", _report_text)
-    _conf_colors = {"HIGH": "green", "MEDIUM": "orange", "LOW": "red"}
-
-    for _i, _sec in enumerate(_sections):
-        if not _sec.strip():
-            continue
-        _lines = _sec.strip().split("\n")
-        _header = _lines[0].lstrip("#").strip()
-        _body = "\n".join(_lines[1:]).strip()
-
-        # Detect confidence badge at end of section
-        _conf_match = _re.search(r"\bConfidence[:\s]+(HIGH|MEDIUM|LOW)\b", _body, _re.IGNORECASE)
-        _conf_label = _conf_match.group(1).upper() if _conf_match else None
-
-        _is_exec = "EXECUTIVE" in _header.upper()
-        with st.expander(_header, expanded=_is_exec):
-            if _conf_label:
-                _bc = _conf_colors.get(_conf_label, "gray")
-                st.markdown(
-                    f"<span style='background:{'#2ecc71' if _bc=='green' else '#e67e22' if _bc=='orange' else '#e74c3c'}33;"
-                    f"color:{'#2ecc71' if _bc=='green' else '#f39c12' if _bc=='orange' else '#e74c3c'};"
-                    f"padding:2px 8px;border-radius:10px;font-size:12px;font-weight:bold'>"
-                    f"Confidence: {_conf_label}</span>",
-                    unsafe_allow_html=True,
+            if not _report_ready:
+                # Show "generate" UI inline — no st.stop(), no st.rerun()
+                st.write(
+                    f"Generate **{_horizon}** risk analysis for **{_ticker}** "
+                    f"using DeepSeek + live web research.  \n"
+                    f"Will lead with: **{_top_driver_name}**"
                 )
-            st.markdown(_body)
-
-    # Report footer
-    from datetime import datetime as _dt
-    st.caption(
-        f"Generated: {_dt.now().strftime('%Y-%m-%d %H:%M')} | "
-        f"Model: DeepSeek (via OpenRouter) | "
-        f"Web sources: {_n_web} | "
-        f"⚠️ For research purposes only — not financial advice"
-    )
-
-    # Download button
-    st.download_button(
-        "📄 Download Report",
-        data=_report_text,
-        file_name=f"{_ticker}_risk_report_{_dt.now().strftime('%Y%m%d')}.md",
-        mime="text/markdown",
-    )
-
-    # Regenerate button
-    if st.button("🔄 Regenerate Report", key="regen_report"):
-        for _k in (_ai_key, _ctx_key):
-            if _k in st.session_state:
-                del st.session_state[_k]
-        st.rerun()
-
-    # ── SECTION 2: RESEARCH CHAT ──────────────────────────────────────────────
-    st.divider()
-    st.subheader("💬 Ask the Analyst")
-
-    _chat_key = f"chat_{_ticker}"
-    if _chat_key not in st.session_state:
-        st.session_state[_chat_key] = []
-
-    # Suggested questions
-    st.write("**Suggested questions:**")
-    _sq_cols = st.columns(3)
-    _sector_str = _ai_ctx.get("sector", "")
-    _suggested_qs = [
-        "What's the biggest hidden risk here?",
-        "Is valuation justified given the risk profile?",
-        "How would a recession impact this specifically?",
-        "What would change your view bullish or bearish?",
-        "Compare to the 2020 COVID crash setup",
-        f"Is the {_sector_str} sector at risk from current macro?",
-    ]
-    for _qi, _q in enumerate(_suggested_qs):
-        if _sq_cols[_qi % 3].button(_q, key=f"sq_{_qi}_{_ticker}"):
-            st.session_state["_pending_q"] = _q
-
-    # Display chat history
-    for _msg in st.session_state[_chat_key]:
-        with st.chat_message(_msg["role"]):
-            st.write(_msg["content"])
-
-    # Handle pending suggested question or typed input
-    _question = st.chat_input("Ask anything about this stock or sector...", key=f"chat_input_{_ticker}")
-    if "_pending_q" in st.session_state:
-        _question = st.session_state.pop("_pending_q")
-
-    if _question and _ai_ctx:
-        st.session_state[_chat_key].append({"role": "user", "content": _question})
-        with st.chat_message("user"):
-            st.write(_question)
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    _answer = chat_with_analyst(
-                        _question, _ai_ctx,
-                        st.session_state[_chat_key][:-1],
-                        driver_profile=_driver_profile_ai,
+                _generate_clicked = st.button(
+                    "Generate Analysis →", type="primary", key="gen_ai"
+                )
+                if not _generate_clicked:
+                    st.info(
+                        f"AI analysis will:\n"
+                        f"- Lead with {_ticker}'s highest-relevance risk driver\n"
+                        f"- Search live news and analyst reports\n"
+                        f"- Generate sector-specific risk narrative\n"
+                        f"- Focus on **{_horizon}** horizon\n\n"
+                        "Takes ~15–20 seconds to generate."
                     )
-                except Exception as _ce:
-                    _answer = f"_Chat error: {_ce}_"
-            st.write(_answer)
-            st.caption("⚠️ Research only — not financial advice")
-        st.session_state[_chat_key].append({"role": "assistant", "content": _answer})
+                else:
+                    # Generate inline — single render pass, no rerun
+                    _smart_sm = st.session_state.get(f"smart_money_{_ticker}")
+                    _insider_sig_ai = _smart_sm[2] if _smart_sm else None
+                    _inst_sig_ai   = _smart_sm[4] if _smart_sm else None
+                    _activist_ai   = _smart_sm[5] if _smart_sm else None
+                    _factor_ai = st.session_state.get(f"factor_{_ticker}")
 
-    if st.session_state[_chat_key]:
-        if st.button("🗑️ Clear chat", key=f"clear_chat_{_ticker}"):
-            st.session_state[_chat_key] = []
+                    _gen_status = st.empty()
+                    _gen_prog   = st.progress(0)
+                    try:
+                        _gen_status.info("🤖 Reading metrics...")
+                        _ai_ctx_new = build_ticker_context(
+                            _ticker, prices, volume, bench_prices, info, macro_df,
+                            fund_scores=st.session_state.get("fund_scores"),
+                            insider_signals=_insider_sig_ai,
+                            inst_signals=_inst_sig_ai,
+                            activist_df=_activist_ai,
+                            factor_results=(
+                                _factor_ai
+                                if _factor_ai and _factor_ai.get("available")
+                                else None
+                            ),
+                            driver_profile=_dp_ai,
+                            horizon=_horizon,
+                        )
+                        st.session_state[_ctx_key] = _ai_ctx_new
+                        _ai_ctx = _ai_ctx_new
+                        _gen_prog.progress(30)
 
-    # ── SECTION 3: SCENARIO ANALYSIS ─────────────────────────────────────────
-    st.divider()
-    st.subheader("🎯 Scenario Analysis")
-    st.write("Click a scenario to get AI-powered impact analysis specific to this company's balance sheet.")
+                        _gen_status.info("🔍 Searching live news...")
+                        _web_res = fetch_web_research(
+                            _ticker, info.get("name", _ticker), info.get("sector", ""),
+                            driver_profile=_dp_ai, horizon=_horizon,
+                        )
+                        _gen_prog.progress(60)
 
-    if _ai_ctx:
-        _scenarios = get_scenarios_for_sector(_ai_ctx.get("sector", ""))
-        _sc_cols = st.columns(min(len(_scenarios), 4))
-        for _si, (_sname, _sparams) in enumerate(_scenarios.items()):
-            with _sc_cols[_si % 4]:
-                st.markdown(f"**{_sname}**")
-                st.caption(", ".join(f"{k}={v}" for k, v in list(_sparams.items())[:2]))
-                if st.button("Analyze", key=f"scenario_{_si}_{_ticker}"):
-                    with st.spinner(f"Analyzing {_sname}..."):
-                        try:
-                            _sresult = evaluate_scenario(_sname, _sparams, _ai_ctx)
-                        except Exception as _sce:
-                            _sresult = {"error": str(_sce)}
-                    # Display result
-                    if "error" in _sresult:
-                        st.error(_sresult["error"])
-                    else:
-                        _prob_c = "#e74c3c" if _sresult.get("probability") == "HIGH" else "#f39c12" if _sresult.get("probability") == "MEDIUM" else "#2ecc71"
-                        st.markdown(
-                            f"<div style='background:{_prob_c}22;border-left:3px solid {_prob_c};"
-                            f"padding:10px 14px;border-radius:4px;margin-top:8px'>"
-                            f"<b style='color:{_prob_c}'>Probability: {_sresult.get('probability','?')}</b><br>"
-                            f"<b>Price impact:</b> {_sresult.get('estimated_price_impact_pct','?')}%<br>"
-                            f"<b>Transmission:</b> {_sresult.get('key_transmission','')}<br>"
-                            f"<b>Company-specific:</b> {_sresult.get('ticker_specific','')}<br>"
-                            f"<b>Precedent:</b> {_sresult.get('historical_precedent','')}<br>"
-                            f"<b>Hedging:</b> {_sresult.get('hedging_implication','')}"
-                            f"</div>", unsafe_allow_html=True)
+                        _gen_status.info("✍️ Writing analysis...")
+                        _report = generate_research_report(
+                            _ai_ctx, _web_res, driver_profile=_dp_ai
+                        )
+                        _gen_prog.progress(100)
+                        st.session_state[_ai_key] = (_report, _web_res, len(_web_res))
+                        _report_ready = True
+                    except Exception as _ae:
+                        st.error(f"Report generation failed: {_ae}")
+                        st.session_state[_ai_key] = (f"_Error: {_ae}_", [], 0)
+                        _report_ready = True
+                    finally:
+                        _gen_status.empty()
+                        _gen_prog.empty()
+
+            if _report_ready:
+                _report_text, _web_res_cached, _n_web = st.session_state[_ai_key]
+
+                # Always-open sections; others open by default too (expanded=True)
+                _ALWAYS_OPEN = {
+                    "WHAT YOU NEED TO KNOW", "TOP 3 RISKS", "BOTTOM LINE",
+                }
+                _sections = _re.split(r"\n(?=##\s)", _report_text)
+                for _sec in _sections:
+                    if not _sec.strip():
+                        continue
+                    _lines = _sec.strip().split("\n")
+                    _hdr = _lines[0].lstrip("#").strip()
+                    _body = "\n".join(_lines[1:]).strip()
+                    if not _body:
+                        continue
+                    _expanded = any(k in _hdr.upper() for k in _ALWAYS_OPEN) or True
+                    with st.expander(_hdr, expanded=_expanded):
+                        st.markdown(_body)
+
+                # Footer
+                st.caption(
+                    f"Generated: {_dt.now().strftime('%Y-%m-%d %H:%M')} | "
+                    f"Model: DeepSeek via OpenRouter | "
+                    f"Web sources: {_n_web} | "
+                    "⚠️ Research only — not financial advice"
+                )
+                _dl_col, _regen_col = st.columns(2)
+                with _dl_col:
+                    st.download_button(
+                        "📄 Download Report",
+                        data=_report_text,
+                        file_name=f"{_ticker}_risk_report_{_dt.now().strftime('%Y%m%d')}.md",
+                        mime="text/markdown",
+                        use_container_width=True,
+                    )
+                with _regen_col:
+                    if st.button("🔄 Regenerate", key="regen_report", use_container_width=True):
+                        for _k in (_ai_key, _ctx_key):
+                            st.session_state.pop(_k, None)
+                        # No rerun — cleared keys will cause pre-report UI on next natural rerun
+
+                # Scenario analysis below report
+                st.divider()
+                st.subheader("🎯 Scenario Analysis")
+                st.caption("Click a scenario to get AI-powered impact analysis specific to this company.")
+                if _ai_ctx:
+                    _scenarios = get_scenarios_for_sector(_ai_ctx.get("sector", ""))
+                    _sc_cols = st.columns(min(len(_scenarios), 4))
+                    for _si, (_sname, _sparams) in enumerate(_scenarios.items()):
+                        with _sc_cols[_si % 4]:
+                            st.markdown(f"**{_sname}**")
+                            st.caption(", ".join(
+                                f"{k}={v}" for k, v in list(_sparams.items())[:2]
+                            ))
+                            if st.button("Analyze", key=f"scenario_{_si}_{_ticker}"):
+                                with st.spinner(f"Analyzing {_sname}..."):
+                                    try:
+                                        _sresult = evaluate_scenario(_sname, _sparams, _ai_ctx)
+                                    except Exception as _sce:
+                                        _sresult = {"error": str(_sce)}
+                                if "error" in _sresult:
+                                    st.error(_sresult["error"])
+                                else:
+                                    _prob_c = (
+                                        "#e74c3c" if _sresult.get("probability") == "HIGH"
+                                        else "#f39c12" if _sresult.get("probability") == "MEDIUM"
+                                        else "#2ecc71"
+                                    )
+                                    st.markdown(
+                                        f"<div style='background:{_prob_c}22;"
+                                        f"border-left:3px solid {_prob_c};"
+                                        f"padding:10px 14px;border-radius:4px;margin-top:8px'>"
+                                        f"<b style='color:{_prob_c}'>Probability: "
+                                        f"{_sresult.get('probability','?')}</b><br>"
+                                        f"<b>Price impact:</b> "
+                                        f"{_sresult.get('estimated_price_impact_pct','?')}%<br>"
+                                        f"<b>Transmission:</b> "
+                                        f"{_sresult.get('key_transmission','')}<br>"
+                                        f"<b>Company-specific:</b> "
+                                        f"{_sresult.get('ticker_specific','')}<br>"
+                                        f"<b>Precedent:</b> "
+                                        f"{_sresult.get('historical_precedent','')}<br>"
+                                        f"<b>Hedging:</b> "
+                                        f"{_sresult.get('hedging_implication','')}"
+                                        f"</div>",
+                                        unsafe_allow_html=True,
+                                    )
+
+        # ── RIGHT: CHAT — always visible ──────────────────────────────────────
+        with _col_chat:
+            st.subheader("💬 Ask the Analyst")
+            st.caption(
+                f"Ask anything about {_ticker} · "
+                "I know its risk metrics, fundamentals, smart money positioning and live news"
+            )
+
+            # Suggested questions as 2×3 compact buttons
+            _sector_str = _ai_ctx.get("sector", info.get("sector", ""))
+            _suggested_qs = [
+                f"What's the #1 risk for {_ticker} this week?",
+                f"How exposed is {_ticker} to {_top_driver_name}?",
+                "Is valuation justified given the risk profile?",
+                "What would make you bullish on this stock?",
+                f"What are institutions doing with {_ticker}?",
+                f"Is the {_sector_str} sector at risk from current macro?",
+            ]
+            st.write("**Try asking:**")
+            _sq1, _sq2 = st.columns(2)
+            for _qi, _q in enumerate(_suggested_qs):
+                _btn_lbl = _q[:42] + "…" if len(_q) > 42 else _q
+                if (_sq1 if _qi % 2 == 0 else _sq2).button(
+                    _btn_lbl, key=f"sq_{_qi}_{_ticker}", use_container_width=True
+                ):
+                    st.session_state["_pending_q"] = _q
+
+            st.divider()
+
+            # Chat history in a fixed-height scrollable container
+            _chat_box = st.container(height=420)
+            with _chat_box:
+                if not st.session_state[_chat_key]:
+                    st.markdown(
+                        f"👋 **Ready to discuss {_ticker}.**\n\n"
+                        "I have access to:\n"
+                        f"- Live risk metrics & factor model\n"
+                        f"- {_top_driver_name} price data\n"
+                        "- Recent news and analyst reports\n"
+                        "- Smart money positioning\n\n"
+                        "What would you like to know?"
+                    )
+                for _msg in st.session_state[_chat_key]:
+                    with st.chat_message(_msg["role"]):
+                        st.write(_msg["content"])
+
+            # Resolve pending suggested-question click
+            _pending = st.session_state.pop("_pending_q", None)
+
+            # Chat input
+            _question = st.chat_input(
+                f"e.g. What is {_ticker}'s biggest risk given current {_top_driver_name} levels?",
+                key=f"chat_input_{_ticker}",
+            )
+            _active_q = _pending or _question
+
+            if _active_q and _ai_ctx:
+                st.session_state[_chat_key].append(
+                    {"role": "user", "content": _active_q}
+                )
+                with _chat_box:
+                    with st.chat_message("user"):
+                        st.write(_active_q)
+                    with st.chat_message("assistant"):
+                        with st.spinner("Thinking..."):
+                            try:
+                                _answer = chat_with_analyst(
+                                    _active_q, _ai_ctx,
+                                    st.session_state[_chat_key][:-1],
+                                    driver_profile=_driver_profile_ai,
+                                )
+                            except Exception as _ce:
+                                _answer = f"_Chat error: {_ce}_"
+                        st.write(_answer)
+                        st.caption("⚠️ Research only — not financial advice")
+                st.session_state[_chat_key].append(
+                    {"role": "assistant", "content": _answer}
+                )
+                # No st.rerun() — Streamlit handles naturally
+
+            if st.session_state[_chat_key]:
+                if st.button("🗑️ Clear chat", key=f"clear_chat_{_ticker}"):
+                    st.session_state[_chat_key] = []
+                    # No rerun needed
