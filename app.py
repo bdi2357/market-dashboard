@@ -1945,6 +1945,27 @@ with _sm_s2:
 # TAB 6 — AI ANALYST
 # ══════════════════════════════════════════════════════════════════════════════
 with tab6:
+    # Anchor at very top of tab content
+    st.markdown('<div id="ai-analyst-top"></div>', unsafe_allow_html=True)
+
+    # Scroll back to this anchor after chat rerun (flag set in chat handler)
+    if st.session_state.pop("_scroll_to_ai", False):
+        import streamlit.components.v1 as _stc_scroll
+        _stc_scroll.html(
+            """
+            <script>
+            (function() {
+                var el = window.parent.document.getElementById('ai-analyst-top');
+                if (el) { el.scrollIntoView({behavior: 'smooth', block: 'start'}); return; }
+                // Fallback: scroll page container to top
+                var c = window.parent.document.querySelector('[data-testid="stAppViewContainer"]');
+                if (c) c.scrollTo({top: 0, behavior: 'smooth'});
+            })();
+            </script>
+            """,
+            height=0,
+        )
+
     import re as _re
     from datetime import datetime as _dt
 
@@ -2189,10 +2210,18 @@ with tab6:
 
             st.divider()
 
-            # Render existing chat history
-            for _msg in st.session_state[_history_key]:
-                with st.chat_message(_msg["role"]):
-                    st.markdown(_msg["content"])
+            # Fixed-height scrollable chat history — keeps scroll self-contained
+            _chat_box = st.container(height=350)
+            with _chat_box:
+                if not st.session_state[_history_key]:
+                    st.markdown(
+                        f"👋 **Ready to discuss {_ticker}.**\n\n"
+                        f"I have access to live risk metrics, {_top_name} price data, "
+                        "recent news and smart money positioning."
+                    )
+                for _msg in st.session_state[_history_key]:
+                    with st.chat_message(_msg["role"]):
+                        st.markdown(_msg["content"])
 
             # ── THE ONLY CORRECT INPUT WIDGET ────────────────────────────────
             # st.chat_input() preserves tab state on submit; st.button() does not.
@@ -2207,28 +2236,27 @@ with tab6:
             )
 
             if _active_q:
+                with st.spinner("Thinking..."):
+                    try:
+                        _answer = chat_with_analyst(
+                            _active_q, _chat_ctx,
+                            st.session_state[_history_key],
+                            driver_profile=_driver_profile_ai,
+                        )
+                    except Exception as _ce:
+                        _answer = f"_Chat error: {_ce}_"
                 st.session_state[_history_key].append(
                     {"role": "user", "content": _active_q}
                 )
-                with st.chat_message("user"):
-                    st.markdown(_active_q)
-                with st.chat_message("assistant"):
-                    with st.spinner("Thinking..."):
-                        try:
-                            _answer = chat_with_analyst(
-                                _active_q, _chat_ctx,
-                                st.session_state[_history_key][:-1],
-                                driver_profile=_driver_profile_ai,
-                            )
-                        except Exception as _ce:
-                            _answer = f"_Chat error: {_ce}_"
-                    st.markdown(_answer)
-                    st.caption("⚠️ Research only — not financial advice")
                 st.session_state[_history_key].append(
                     {"role": "assistant", "content": _answer}
                 )
-                # DO NOT call st.rerun() here
+                # Flag so the next render scrolls back to AI Analyst anchor
+                st.session_state["_scroll_to_ai"] = True
+                # Safe to rerun — st.chat_input preserves tab state across reruns
+                st.rerun()
 
             if st.session_state[_history_key]:
                 if st.button("🗑️ Clear chat", key=f"clear_chat_{_ticker}"):
                     st.session_state[_history_key] = []
+                    st.rerun()
