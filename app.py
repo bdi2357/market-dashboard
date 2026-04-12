@@ -144,18 +144,32 @@ st.title("📊 Market Risk Dashboard")
 # ── Data loading ──────────────────────────────────────────────────────────────
 if load:
     _progress = st.progress(0, text="Fetching price data...")
-    df = fetch_ohlcv(ticker, start_date, end_date)
-    _progress.progress(20, text="Fetching benchmark data...")
-    bench_df = fetch_ohlcv(benchmark, start_date, end_date)
-    _progress.progress(35, text="Fetching ticker metadata...")
-    info = fetch_ticker_info(ticker)
-    sector_etf = get_sector_etf(ticker)
-    _progress.progress(50, text=f"Fetching sector ETF ({sector_etf})...")
-    sector_df = fetch_ohlcv(sector_etf, start_date, end_date)
-    _progress.progress(70, text="Fetching FRED macro data (DGS10, VIX, spreads)...")
-    macro_df = fetch_macro(start_date, end_date)
-    _progress.progress(100, text="Done.")
-    _progress.empty()
+    try:
+        df = fetch_ohlcv(ticker, start_date, end_date)
+        _progress.progress(20, text="Fetching benchmark data...")
+        bench_df = fetch_ohlcv(benchmark, start_date, end_date)
+        _progress.progress(35, text="Fetching ticker metadata...")
+        info = fetch_ticker_info(ticker)
+        sector_etf = get_sector_etf(ticker)
+        _progress.progress(50, text=f"Fetching sector ETF ({sector_etf})...")
+        sector_df = fetch_ohlcv(sector_etf, start_date, end_date)
+        _progress.progress(70, text="Fetching FRED macro data (DGS10, VIX, spreads)...")
+        macro_df = fetch_macro(start_date, end_date)
+        _progress.progress(100, text="Done.")
+        _progress.empty()
+    except Exception as _load_err:
+        _progress.empty()
+        _err_msg = str(_load_err)
+        if "rate limit" in _err_msg.lower() or "429" in _err_msg or "RateLimit" in type(_load_err).__name__:
+            st.error(
+                "**Yahoo Finance rate limit reached.** "
+                "Streamlit Cloud's shared IPs are sometimes throttled by Yahoo Finance. "
+                "Wait 1–2 minutes and click **Load Data** again. "
+                "Cached data (if any) will be used automatically on the next attempt."
+            )
+        else:
+            st.error(f"**Data fetch failed:** {_load_err}")
+        st.stop()
 
     st.session_state.df = df
     st.session_state.bench_df = bench_df

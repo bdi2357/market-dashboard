@@ -8,19 +8,57 @@ Data fetching layer.
 
 import os
 import re
+import time
+import random
 import hashlib
+import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from pathlib import Path
 from datetime import date, timedelta
 from typing import Optional
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Path to secrets.toml relative to this file (../../.streamlit/secrets.toml)
 _SECRETS_PATH = Path(__file__).parent.parent / ".streamlit" / "secrets.toml"
+
+
+def _create_yf_session() -> requests.Session:
+    """
+    Return a requests Session that mimics a browser and retries on 429/5xx.
+    Passing this to yf.Ticker(session=...) bypasses Streamlit Cloud IP blocks.
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    return session
+
+
+# Single session shared across all yfinance calls
+_YF_SESSION = _create_yf_session()
 
 
 def _get_fred_key() -> str:
@@ -86,18 +124,37 @@ def _save_cache(key: str, df: pd.DataFrame) -> None:
 
 
 def fetch_ohlcv(ticker: str, start: date, end: date) -> pd.DataFrame:
-    """Return OHLCV DataFrame with timezone-naive DatetimeIndex."""
+    """Return OHLCV DataFrame with timezone-naive DatetimeIndex.
+
+    Uses a browser-like session and exponential-backoff retry to work around
+    the Yahoo Finance rate limits common on Streamlit Cloud shared IPs.
+    """
     key = f"ohlcv_{ticker}_{start}_{end}"
     cached = _load_cache(key)
     if cached is not None:
         return cached
-    df = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
-    if df.empty:
-        return df
-    df.index = df.index.tz_localize(None)
-    df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-    _save_cache(key, df)
-    return df
+
+    last_err: Exception = RuntimeError("unknown error")
+    for attempt in range(4):
+        if attempt > 0:
+            time.sleep((2 ** attempt) + random.uniform(0.5, 2.0))
+        try:
+            df = yf.Ticker(ticker, session=_YF_SESSION).history(
+                start=start, end=end, auto_adjust=True
+            )
+            if df is not None and not df.empty:
+                df.index = df.index.tz_localize(None)
+                df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+                _save_cache(key, df)
+                return df
+        except Exception as e:
+            last_err = e
+            if "RateLimit" not in type(e).__name__ and attempt == 3:
+                raise
+    raise Exception(
+        f"Yahoo Finance rate limit reached for {ticker} after 4 attempts. "
+        f"Wait 1-2 minutes and try again. (Last error: {last_err})"
+    )
 
 
 def fetch_ticker_info(ticker: str) -> dict:
@@ -109,8 +166,10 @@ def fetch_ticker_info(ticker: str) -> dict:
             return pd.read_parquet(path).iloc[0].to_dict()
         except Exception:
             pass
-    t = yf.Ticker(ticker)
-    info = t.info or {}
+    try:
+        info = yf.Ticker(ticker, session=_YF_SESSION).info or {}
+    except Exception:
+        info = {}
     result = {
         "sector": info.get("sector", "Unknown"),
         "industry": info.get("industry", "Unknown"),
