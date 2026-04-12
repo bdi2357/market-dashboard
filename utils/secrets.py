@@ -18,3 +18,4 @@ def get_secret(key: str, default: str = "") -> str:
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY")
 TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
 FRED_API_KEY = get_secret("FRED_API_KEY")
+POLYGON_API_KEY = get_secret("POLYGON_API_KEY")

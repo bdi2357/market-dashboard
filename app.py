@@ -29,7 +29,7 @@ import yfinance as yf
 # Inject API keys from Streamlit secrets (Streamlit Cloud) into os.environ so
 # all downstream modules that use os.getenv() work without modification.
 # On local dev, keys come from .env (loaded by analyst.py via python-dotenv).
-for _secret_key in ("FRED_API_KEY", "OPENROUTER_API_KEY", "TAVILY_API_KEY"):
+for _secret_key in ("FRED_API_KEY", "OPENROUTER_API_KEY", "TAVILY_API_KEY", "POLYGON_API_KEY"):
     if _secret_key not in os.environ:
         try:
             os.environ[_secret_key] = st.secrets[_secret_key]
@@ -140,6 +140,19 @@ with st.sidebar:
         st.caption(f"⚡ {ticker} loaded · click to refresh")
 
 st.title("📊 Market Risk Dashboard")
+
+# ── Polygon key banner (shown once until key is set) ──────────────────────────
+if not os.environ.get("POLYGON_API_KEY"):
+    st.warning(
+        "**Polygon.io API key not set** — Yahoo Finance will be used as fallback, "
+        "but it may be rate-limited on Streamlit Cloud.\n\n"
+        "**Free setup (2 minutes, no credit card):**\n"
+        "1. Go to [polygon.io](https://polygon.io) → *Get Started Free*\n"
+        "2. Copy your API key\n"
+        "3. In Streamlit Cloud: *Manage App → Secrets* → add:\n"
+        "```toml\nPOLYGON_API_KEY = \"your-key-here\"\n```\n"
+        "4. Save — app reboots automatically. Free tier: unlimited daily requests."
+    )
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 if load:

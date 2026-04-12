@@ -126,9 +126,21 @@ def _save_cache(key: str, df: pd.DataFrame) -> None:
 def fetch_ohlcv(ticker: str, start: date, end: date) -> pd.DataFrame:
     """Return OHLCV DataFrame with timezone-naive DatetimeIndex.
 
-    Uses a browser-like session and exponential-backoff retry to work around
-    the Yahoo Finance rate limits common on Streamlit Cloud shared IPs.
+    Source priority:
+      1. Polygon.io  — unlimited free tier, no cloud IP blocks
+      2. yfinance    — browser-session + exponential-backoff retry (local fallback)
     """
+    errors: list[str] = []
+
+    # 1. Polygon (primary)
+    if os.environ.get("POLYGON_API_KEY"):
+        try:
+            from data.polygon_fetcher import polygon_fetch_ohlcv
+            return polygon_fetch_ohlcv(ticker, str(start), str(end))
+        except Exception as e:
+            errors.append(f"Polygon: {e}")
+
+    # 2. yfinance (fallback)
     key = f"ohlcv_{ticker}_{start}_{end}"
     cached = _load_cache(key)
     if cached is not None:
@@ -149,16 +161,35 @@ def fetch_ohlcv(ticker: str, start: date, end: date) -> pd.DataFrame:
                 return df
         except Exception as e:
             last_err = e
+            errors.append(f"yfinance attempt {attempt + 1}: {e}")
             if "RateLimit" not in type(e).__name__ and attempt == 3:
                 raise
+
     raise Exception(
-        f"Yahoo Finance rate limit reached for {ticker} after 4 attempts. "
-        f"Wait 1-2 minutes and try again. (Last error: {last_err})"
+        f"All data sources failed for {ticker}. "
+        f"Errors: {' | '.join(errors)} | "
+        f"Last yfinance error: {last_err}"
     )
 
 
 def fetch_ticker_info(ticker: str) -> dict:
-    """Return sector, industry, market cap, name from yfinance."""
+    """Return sector, industry, market cap, name.
+
+    Source priority:
+      1. Polygon.io  — SIC description mapped to GICS sector
+      2. yfinance    — fallback with native GICS sector
+    """
+    # 1. Polygon (primary)
+    if os.environ.get("POLYGON_API_KEY"):
+        try:
+            from data.polygon_fetcher import polygon_fetch_ticker_details
+            info = polygon_fetch_ticker_details(ticker)
+            if info:
+                return info
+        except Exception as e:
+            print(f"Polygon ticker info failed for {ticker}: {e}")
+
+    # 2. yfinance (fallback) — uses own 24h parquet cache
     key = f"info_{ticker}"
     path = _cache_path(key)
     if path.exists():

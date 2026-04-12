@@ -284,13 +284,36 @@ def fetch_web_research(
     horizon: str = "1 Month",
 ) -> list[dict]:
     """
-    Run up to 7 targeted Tavily searches, prioritising primary risk drivers.
-    Returns top-10 results by relevance. Empty list on any error.
+    Returns up to 10 research results.
+    Sources (in order):
+      1. Polygon.io news (structured, reliable, free tier)
+      2. Tavily web search (driver-specific + earnings + credit queries)
     """
+    results: list[dict] = []
+    seen_urls: set[str] = set()
+
+    # 1. Polygon news (primary — structured, no rate issues for news endpoint)
+    try:
+        from data.polygon_fetcher import polygon_fetch_news
+        for item in polygon_fetch_news(ticker, limit=5):
+            url = item.get("url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                results.append({
+                    "title": item["title"],
+                    "url": url,
+                    "content": item.get("summary", "")[:500],
+                    "score": 0.9,
+                    "source": item.get("source", "Polygon News"),
+                })
+    except Exception as e:
+        logger.debug(f"Polygon news fetch failed: {e}")
+
+    # 2. Tavily web search
     client = _get_tavily()
     if not client:
         logger.warning("Tavily key missing — skipping web research")
-        return []
+        return results
 
     queries: list[str] = []
 
@@ -309,9 +332,6 @@ def fetch_web_research(
     # Always include earnings + credit
     queries.append(f"{ticker} earnings guidance analyst 2026")
     queries.append(f"{company} credit debt refinancing")
-
-    seen_urls: set[str] = set()
-    results: list[dict] = []
 
     for query in queries[:7]:
         try:
